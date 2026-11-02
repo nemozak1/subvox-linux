@@ -334,7 +334,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
         return
 
     cal = calib.HeadCalibration.load()
-    src = "calibrated" if cal.up else "uncalibrated: first second at rest defines up, yaw only is trustworthy"
+    src = "calibrated" if cal.up else "uncalibrated: first second at rest defines up; nod/tilt a few times so the gyro scale can be learnt"
     tracker = sp.HeadTracker(cal, recentre_tau=a.recentre)
     q: queue.Queue = queue.Queue()
     stop = threading.Event()
@@ -366,7 +366,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                         status_line(f"{motion.sample_rate:4.1f} Hz  yaw {pose.yaw:+6.1f}° pitch {pose.pitch:+5.1f}° roll {pose.roll:+5.1f}°  "
                                     f"{'still ' if pose.still else 'moving'} {pose.rate:5.1f}°/s  "
                                     f"FL {st['spFL'][0]:5.1f}°/{st['spFL'][1]:+5.1f}°  FR {st['spFR'][0]:5.1f}°/{st['spFR'][1]:+5.1f}°  "
-                                    f"sent {renderer.updates}")
+                                    f"sent {renderer.updates}  gyro {tracker.scale:.2e} rad/LSB (n={len(tracker.scale_estimates)})")
     except KeyboardInterrupt:
         pass
     finally:

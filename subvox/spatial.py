@@ -128,6 +128,12 @@ class HeadTracker:
         self._boot_acc: list[Vec] = []
         self.ready = self.up is not None
         self.rate = 0.0
+        # Online gyro scale: angle the gravity vector turned through vs. the raw gyro integral
+        # over the same window. Robust median of many nods/tilts. Off when the file is calibrated.
+        self.auto_scale = cal.up is None
+        self.scale = cal.gyro_rad_per_lsb
+        self._win: list[tuple[float, Vec, Vec]] = []   # (t, up_dev, raw gyro - bias)
+        self.scale_estimates: list[float] = []
 
     # -- frame
     def _init_frame(self, up: Vec) -> None:
@@ -162,7 +168,10 @@ class HeadTracker:
             return None
 
         c = self.cal
-        w = tuple(c.gyro_sign * (g - b) * c.gyro_rad_per_lsb for g, b in zip(s.raw_gyro, c.gyro_bias))
+        raw = tuple(g - b for g, b in zip(s.raw_gyro, c.gyro_bias))
+        if self.auto_scale and 0.9 < a_mag < 1.1:
+            self._learn_scale(s.t, norm(a), raw, dt)
+        w = tuple(c.gyro_sign * r * self.scale for r in raw)
         self.rate = math.sqrt(dot(w, w))
         # integrate body rates
         self.q = qnorm(qmul(self.q, qfrom_rotvec(tuple(x * dt for x in w))))
@@ -185,6 +194,29 @@ class HeadTracker:
             self.q_ref = qslerp(self.q_ref, self.q, min(1.0, dt / self.recentre_tau))
 
         return self.pose(still)
+
+    def _learn_scale(self, t: float, u: Vec, raw: Vec, dt: float) -> None:
+        self._win.append((t, u, tuple(r * dt for r in raw)))
+        self._win = [e for e in self._win if e[0] >= t - 0.8]
+        if len(self._win) < 5:
+            return
+        u0 = self._win[0][1]
+        theta = math.acos(max(-1.0, min(1.0, dot(u0, u))))
+        if theta < math.radians(8):
+            return
+        integ = tuple(sum(e[2][i] for e in self._win[1:]) for i in range(3))
+        mid = norm(tuple(a + b for a, b in zip(u0, u)))
+        perp = tuple(x - dot(integ, mid) * m for x, m in zip(integ, mid))   # only rotation ⟂ up tilts it
+        mag = math.sqrt(dot(perp, perp))
+        if mag <= 0:
+            return
+        est = theta / mag
+        if 1e-5 < est < 1e-1:
+            self.scale_estimates.append(est)
+            self.scale_estimates = self.scale_estimates[-25:]
+            if len(self.scale_estimates) >= 3:
+                self.scale = sorted(self.scale_estimates)[len(self.scale_estimates) // 2]
+        self._win.clear()
 
     # -- readouts
     def q_rel(self) -> Quat:
