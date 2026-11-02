@@ -340,10 +340,15 @@ class StageRenderer:
     """Smooths and rate-limits the per-speaker azimuth/elevation and pushes changes."""
 
     def __init__(self, control: SpatializerControl, spread: float = 30.0, smooth_tau: float = 0.04,
-                 min_change: float = 0.2, elevation: bool = True, lead: float = 0.2) -> None:
+                 min_change: float = 1.0, elevation: bool = True, lead: float = 0.2,
+                 lead_min_rate_deg: float = 8.0) -> None:
+        """Every change rebuilds both HRIRs and crossfades them over one quantum, which is audible
+        as a faint flutter, so changes are only sent when a speaker moves by `min_change` degrees,
+        and the lead prediction (which amplifies sensor jitter) is faded in above `lead_min_rate_deg`."""
         self.control = control
         self.spread = spread
         self.lead = lead
+        self.lead_min_rate = lead_min_rate_deg
         self.smooth_tau = smooth_tau
         self.min_change = min_change
         self.elevation = elevation
@@ -358,8 +363,10 @@ class StageRenderer:
         alpha = 1.0 - math.exp(-dt / self.smooth_tau) if self.smooth_tau > 0 else 1.0
         changed = False
         values: dict[str, float] = {}
+        rate_deg = math.degrees(tracker.rate)
+        lead = self.lead * max(0.0, min(1.0, (rate_deg - self.lead_min_rate) / self.lead_min_rate))
         for name, sign in SPEAKERS.items():
-            az, el = tracker.speaker_direction(sign * self.spread, lead=self.lead)
+            az, el = tracker.speaker_direction(sign * self.spread, lead=lead)
             if not self.elevation:
                 el = 0.0
             paz, pel = self.state[name]

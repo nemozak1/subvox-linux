@@ -316,7 +316,8 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     if node is None:
         sys.exit("sink 'subvox_spatial' not found; run tools/install-spatial.sh")
     control = sp.SpatializerControl(node)
-    renderer = sp.StageRenderer(control, spread=a.spread, smooth_tau=a.smooth, elevation=not a.no_elevation, lead=a.lead)
+    renderer = sp.StageRenderer(control, spread=a.spread, smooth_tau=a.smooth, elevation=not a.no_elevation, lead=a.lead,
+                                min_change=a.deadband)
     period = 1.0 / a.rate
     if a.demo:
         tracker = sp.DemoTracker()
@@ -433,12 +434,13 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("calibrate"); p.add_argument("--analyze", metavar="CSV", help="re-analyse a recording instead of recording")
     p.add_argument("--save", action="store_true", help="with --analyze: write head-calibration.json"); p.set_defaults(fn=cmd_calibrate)
     p = sub.add_parser("spatial"); p.add_argument("--demo", action="store_true", help="sweep yaw without the buds (load test)")
-    p.add_argument("--rate", type=float, default=25.0, help="control updates per second (25 = every motion frame)")
+    p.add_argument("--rate", type=float, default=12.5, help="max control updates per second (each one rebuilds the HRIRs)")
     p.add_argument("--spread", type=float, default=30.0, help="speaker half-angle, degrees")
     p.add_argument("--smooth", type=float, default=0.04, help="smoothing time constant, s")
     p.add_argument("--lead", type=float, default=0.2, help="aim at the head pose this far ahead, s (A2DP ~0.21 + quantum 0.02; 0 = off)")
     p.add_argument("--recentre", type=float, default=6.0, help="recentre time constant when still, s (0 = never)")
     p.add_argument("--gyro", action="store_true", help="integrate the gyro instead of using the attitude quaternion")
+    p.add_argument("--deadband", type=float, default=1.0, help="only send when a speaker moved this many degrees")
     p.add_argument("--no-elevation", action="store_true"); p.set_defaults(fn=cmd_spatial)
     sub.add_parser("recentre").set_defaults(fn=cmd_recentre)
     sub.add_parser("list").set_defaults(fn=cmd_list)
