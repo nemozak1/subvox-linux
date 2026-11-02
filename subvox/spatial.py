@@ -1,9 +1,10 @@
 """Head-tracked spatial audio: keep the virtual speakers of the "Spatial (Powerbeats)" sink
 fixed in the room while the head turns.
 
-Pipeline: HeadphoneMotion (25 Hz) -> HeadTracker (gyro integration + gravity correction,
-quaternion) -> 10 Hz: where are the ±30° speakers seen from the head? -> pw-cli set-param
-on the filter-chain sink's spatializer controls (Azimuth / Elevation per speaker).
+Pipeline: HeadphoneMotion (25 Hz) -> HeadTracker (the buds' own fused attitude quaternion, see
+calibrate.py; `--gyro` integrates the coarse gyro instead) -> 10 Hz: where are the ±30° speakers
+seen from the head? -> pw-cli set-param on the filter-chain sink's spatializer controls
+(Azimuth / Elevation per speaker).
 
 Like Apple's head tracking the reference frame drifts back to wherever the head has been
 pointing for a while, so looking away briefly moves the stage and settling in recentres it.
@@ -20,7 +21,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .calibrate import HeadCalibration
+from .calibrate import HeadCalibration, quat_from_words
 from .motion import ACCEL_LSB_PER_G, HeadphoneMotion, MotionSample
 
 Vec = tuple[float, float, float]
@@ -112,8 +113,9 @@ class HeadTracker:
     """
 
     def __init__(self, cal: HeadCalibration, gravity_tau: float = 2.0, recentre_tau: float = 6.0,
-                 still_rate_deg: float = 4.0, still_after: float = 1.0) -> None:
+                 still_rate_deg: float = 4.0, still_after: float = 1.0, use_quaternion: bool = True) -> None:
         self.cal = cal
+        self.use_quaternion = use_quaternion
         self.gravity_tau = gravity_tau
         self.recentre_tau = recentre_tau
         self.still_rate = math.radians(still_rate_deg)
@@ -150,7 +152,8 @@ class HeadTracker:
 
     # -- update
     def update(self, s: MotionSample) -> Pose | None:
-        a = tuple(v / ACCEL_LSB_PER_G for v in s.raw_accel)
+        # The accelerometer points along gravity, so head "up" is -accel.
+        a = tuple(-v / ACCEL_LSB_PER_G for v in s.raw_accel)
         a_mag = math.sqrt(dot(a, a))
         if not self.ready:
             # No calibration: the first second at rest defines "up".
@@ -159,28 +162,43 @@ class HeadTracker:
                 self._init_frame(tuple(sum(v[i] for v in self._boot_acc) / len(self._boot_acc) for i in range(3)))
             return None
 
-        if self._t_prev is None:
+        if self.use_quaternion:
+            q = quat_from_words(*s.raw_orient[:3])
+            if q is None:
+                return None
+            if self._t_prev is None:
+                self.q = self.q_ref = q
+                self._t_prev = s.t
+                return None
+            dt = s.t - self._t_prev
             self._t_prev = s.t
-            return None
-        dt = s.t - self._t_prev
-        self._t_prev = s.t
-        if not 0 < dt < 0.5:
-            return None
-
-        c = self.cal
-        raw = tuple(g - b for g, b in zip(s.raw_gyro, c.gyro_bias))
-        if self.auto_scale and 0.9 < a_mag < 1.1:
-            self._learn_scale(s.t, norm(a), raw, dt)
-        w = tuple(c.gyro_sign * r * self.scale for r in raw)
-        self.rate = math.sqrt(dot(w, w))
-        # integrate body rates
-        self.q = qnorm(qmul(self.q, qfrom_rotvec(tuple(x * dt for x in w))))
-        # gravity pulls pitch/roll back when the accelerometer reads ~1 g
-        if 0.8 < a_mag < 1.2:
-            u_room = qrot(self.q, norm(a))
-            err = cross(u_room, self.up)
-            k = min(1.0, dt / self.gravity_tau)
-            self.q = qnorm(qmul(qfrom_rotvec(tuple(e * k for e in err)), self.q))
+            if not 0 < dt < 0.5:
+                return None
+            dq = qmul(q, qconj(self.q))
+            self.rate = 2 * math.acos(min(1.0, abs(dq[0]))) / dt
+            self.q = q
+        else:
+            if self._t_prev is None:
+                self._t_prev = s.t
+                return None
+            dt = s.t - self._t_prev
+            self._t_prev = s.t
+            if not 0 < dt < 0.5:
+                return None
+            c = self.cal
+            raw = tuple(g - b for g, b in zip(s.raw_gyro, c.gyro_bias))
+            if self.auto_scale and 0.9 < a_mag < 1.1:
+                self._learn_scale(s.t, norm(a), raw, dt)
+            w = tuple(c.gyro_sign * r * self.scale for r in raw)
+            self.rate = math.sqrt(dot(w, w))
+            # integrate body rates
+            self.q = qnorm(qmul(self.q, qfrom_rotvec(tuple(x * dt for x in w))))
+            # gravity pulls pitch/roll back when the accelerometer reads ~1 g
+            if 0.8 < a_mag < 1.2:
+                u_room = qrot(self.q, norm(a))
+                err = cross(u_room, self.up)
+                k = min(1.0, dt / self.gravity_tau)
+                self.q = qnorm(qmul(qfrom_rotvec(tuple(e * k for e in err)), self.q))
 
         # stillness + recentring
         now = s.t

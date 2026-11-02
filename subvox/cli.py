@@ -271,6 +271,8 @@ def cmd_calibrate(a: argparse.Namespace) -> None:
         total = sum(sec for _, _, sec in calib.PHASES)
         print(f"{len(calib.PHASES)} prompts, {total} s. Wear the buds, face where the music should come from.")
         input("Press Enter to start ...")
+        while not q.empty():      # drop everything streamed before the first prompt
+            q.get_nowait()
         rows: list[dict] = []
         phase = "start"
         t_end = time.monotonic()
@@ -334,8 +336,9 @@ def cmd_spatial(a: argparse.Namespace) -> None:
         return
 
     cal = calib.HeadCalibration.load()
-    src = "calibrated" if cal.up else "uncalibrated: first second at rest defines up; nod/tilt a few times so the gyro scale can be learnt"
-    tracker = sp.HeadTracker(cal, recentre_tau=a.recentre)
+    src = ("calibrated" if cal.up else "uncalibrated: first second at rest defines up, yaw only is right") + \
+          (", gyro integration" if a.gyro else ", buds' attitude quaternion")
+    tracker = sp.HeadTracker(cal, recentre_tau=a.recentre, use_quaternion=not a.gyro)
     q: queue.Queue = queue.Queue()
     stop = threading.Event()
     motion = motion_thread(resolve_mac(a.mac), q, stop)
@@ -366,7 +369,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                         status_line(f"{motion.sample_rate:4.1f} Hz  yaw {pose.yaw:+6.1f}° pitch {pose.pitch:+5.1f}° roll {pose.roll:+5.1f}°  "
                                     f"{'still ' if pose.still else 'moving'} {pose.rate:5.1f}°/s  "
                                     f"FL {st['spFL'][0]:5.1f}°/{st['spFL'][1]:+5.1f}°  FR {st['spFR'][0]:5.1f}°/{st['spFR'][1]:+5.1f}°  "
-                                    f"sent {renderer.updates}  gyro {tracker.scale:.2e} rad/LSB (n={len(tracker.scale_estimates)})")
+                                    f"sent {renderer.updates}" + (f"  gyro {tracker.scale:.2e} rad/LSB (n={len(tracker.scale_estimates)})" if a.gyro else ""))
     except KeyboardInterrupt:
         pass
     finally:
@@ -415,6 +418,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--spread", type=float, default=30.0, help="speaker half-angle, degrees")
     p.add_argument("--smooth", type=float, default=0.1, help="smoothing time constant, s")
     p.add_argument("--recentre", type=float, default=6.0, help="recentre time constant when still, s (0 = never)")
+    p.add_argument("--gyro", action="store_true", help="integrate the gyro instead of using the attitude quaternion")
     p.add_argument("--no-elevation", action="store_true"); p.set_defaults(fn=cmd_spatial)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     p = sub.add_parser("forget"); p.add_argument("word"); p.set_defaults(fn=cmd_forget)

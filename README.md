@@ -56,24 +56,27 @@ Report layout (offsets into the 58-byte report):
 | 9–11 | flags |
 | 12–15 | u32 timestamp, µs |
 | 16–19 | zero |
-| 20–27 | 4 × i16 orientation words (slow attitude, scale unknown) |
+| 20–27 | 3 × i16 = vector part of a unit quaternion / 32768 (w = √(1−|v|²)), sensor → gravity-aligned world frame, yaw included; i16 word 3 ≈ 0 |
 | 28–33 | 3 × i16, unidentified |
 | 34–37 | marker `xx 0E 16 13` |
 | 38–43 | 3 × i16 gyroscope, raw |
-| 44–49 | 3 × i16 accelerometer, 1 g = 1024 LSB, gravity included |
+| 44–49 | 3 × i16 accelerometer, 1 g = 1024 LSB, gravity included, points *down* (along gravity) |
 | 50–53 | f32, −1.0 until sensor fusion settles |
 | 54–57 | u32 sample counter, +8 per frame |
 
 The reader low-passes the accelerometer for a gravity estimate and subtracts it to get user
-acceleration, as CoreMotion does. Gyro and orientation scales are guesses; the classifier
-z-scales every channel, so only the shape matters.
+acceleration, as CoreMotion does. The gyro is coarse and its integral does not match the quaternion's rotation (scatter
+of 5× across moves), so it is only used as a shape feature; the classifier z-scales every channel.
+The quaternion was confirmed 2026-11-02 (`subvox calibrate`): q·accel is one fixed world vector in
+every head pose (5° scatter, 12° raw), turn axes are exactly ±up, nod axes exactly perpendicular.
 
 ## Known limits
 
 Same as the Mac app, plus:
 
-- Orientation is three raw words, not a quaternion; only within-segment changes are used.
-- Gyro units are approximate (`GYRO_RAD_PER_LSB` in `motion.py`).
+- The classifier still treats the three orientation words as separate channels rather than as the
+  quaternion they are.
+- Gyro units are approximate (`GYRO_RAD_PER_LSB` in `motion.py`); the raw gyro is not a clean rate.
 - One connected device at a time; pass `--mac` if several are connected.
 - Terminal UI: Space toggles capture rather than hold-to-capture.
 
@@ -96,19 +99,19 @@ tools/install-spatial.sh --remove
 The spatializer controls are live: `pw-cli set-param <sink id> Props '{ params = [ "spFL:Azimuth" 60.0 ] }'`.
 SOFA azimuth is counter-clockwise from the front, 0–360. Nothing is installed system-wide.
 
-**Head tracking** (`subvox/spatial.py`): `python3 -m subvox spatial` integrates the gyro into a
-quaternion, pulls pitch/roll back to the accelerometer's gravity, and every 100 ms asks where the
-two room-fixed ±30° speakers are seen from the head, pushing their Azimuth/Elevation to the sink
-through a long-lived `pw-cli`. The reference frame slides back to the current pose while the head
+**Head tracking** (`subvox/spatial.py`): `python3 -m subvox spatial` takes the buds' own fused
+attitude quaternion from each frame (`--gyro` integrates the gyro with gravity correction instead)
+and every 100 ms asks where the two room-fixed ±30° speakers are seen from the head, pushing their
+Azimuth/Elevation to the sink through a long-lived `pw-cli`. The reference frame slides back to the current pose while the head
 is still (`--recentre 6` s time constant, `c` recentres at once), as Apple's does. Regenerating
 the HRIRs at 10 Hz costs the filter-chain process ~0.6 % CPU. `--demo` sweeps yaw ±60° without
 the buds. A2DP adds ~150–250 ms, so it lags Apple's.
 
 **Calibration** (`subvox/calibrate.py`): `python3 -m subvox calibrate` prompts 13 timed moves
 (still, left/right 90°, up/down, tilt) and records raw frames to
-`~/.local/share/subvox/calibration/<timestamp>.csv`, then derives the gyro scale (from the
-gravity-measured tilts, cross-checked against the 90° turns), the head's up/left/forward axes in
-the sensor frame, the gyro handedness, and which of the four orientation words track yaw / pitch /
-roll. It writes `~/.local/share/subvox/head-calibration.json`, which `spatial` loads.
-`--analyze <csv> [--save]` re-runs the analysis on a recording. Uncalibrated, `spatial` takes
-"up" from the first second at rest and trusts yaw only.
+`~/.local/share/subvox/calibration/<timestamp>.csv`, then verifies the quaternion, derives the
+head's up/left/forward axes in the sensor frame (up from gravity, left from the quaternion change
+when nodding), the world up vector, and a gyro scale as a fallback. It writes
+`~/.local/share/subvox/head-calibration.json`, which `spatial` loads. `--analyze <csv> [--save]`
+re-runs the analysis on a recording. Uncalibrated, `spatial` takes "up" from the first second at
+rest and gets yaw right but mixes pitch and roll.
