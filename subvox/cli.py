@@ -346,6 +346,9 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     motion = motion_thread(resolve_mac(a.mac), q, stop)
     print(f"spatial: sink {node}, {src}; keys: c recentre, q quit; `subvox recentre` from another shell")
     signal.signal(signal.SIGUSR1, lambda *_: tracker.recentre())
+    import os
+    calib.CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SPATIAL_PID.write_text(str(os.getpid()))
     next_tick = time.monotonic()
     pose = None
     try:
@@ -379,13 +382,20 @@ def cmd_spatial(a: argparse.Namespace) -> None:
         stop.set()
         renderer.reset()
         control.close()
+        SPATIAL_PID.unlink(missing_ok=True)
         print()
 
 
+SPATIAL_PID = calib.CALIBRATION_PATH.parent / "spatial.pid"
+
+
 def cmd_recentre(a: argparse.Namespace) -> None:
-    import subprocess
-    r = subprocess.run(["pkill", "-USR1", "-f", r"python3( -u)? -m subvox spatial"])
-    print("recentred" if r.returncode == 0 else "no running `subvox spatial`")
+    import os
+    try:
+        os.kill(int(SPATIAL_PID.read_text()), signal.SIGUSR1)
+        print("recentred")
+    except (OSError, ValueError):
+        sys.exit("no running `subvox spatial`")
 
 
 def cmd_list(a: argparse.Namespace) -> None:
