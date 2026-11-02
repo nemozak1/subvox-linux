@@ -7,6 +7,7 @@
   subvox record <condition>           motion.csv session like the Mac app's Record Session
   subvox calibrate [--analyze file]   scripted head moves -> head-calibration.json for spatial
   subvox spatial [--demo]             head-tracked spatial audio on the "Spatial (Powerbeats)" sink
+  subvox recentre                     tell a running `spatial` that where you look now is the front
   subvox list | subvox forget <word>
 """
 
@@ -17,6 +18,7 @@ import json
 import math
 import queue
 import select
+import signal
 import sys
 import termios
 import threading
@@ -342,7 +344,8 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     q: queue.Queue = queue.Queue()
     stop = threading.Event()
     motion = motion_thread(resolve_mac(a.mac), q, stop)
-    print(f"spatial: sink {node}, {src}; keys: c recentre, q quit")
+    print(f"spatial: sink {node}, {src}; keys: c recentre, q quit; `subvox recentre` from another shell")
+    signal.signal(signal.SIGUSR1, lambda *_: tracker.recentre())
     next_tick = time.monotonic()
     pose = None
     try:
@@ -377,6 +380,12 @@ def cmd_spatial(a: argparse.Namespace) -> None:
         renderer.reset()
         control.close()
         print()
+
+
+def cmd_recentre(a: argparse.Namespace) -> None:
+    import subprocess
+    r = subprocess.run(["pkill", "-USR1", "-f", r"python3( -u)? -m subvox spatial"])
+    print("recentred" if r.returncode == 0 else "no running `subvox spatial`")
 
 
 def cmd_list(a: argparse.Namespace) -> None:
@@ -420,6 +429,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--recentre", type=float, default=6.0, help="recentre time constant when still, s (0 = never)")
     p.add_argument("--gyro", action="store_true", help="integrate the gyro instead of using the attitude quaternion")
     p.add_argument("--no-elevation", action="store_true"); p.set_defaults(fn=cmd_spatial)
+    sub.add_parser("recentre").set_defaults(fn=cmd_recentre)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     p = sub.add_parser("forget"); p.add_argument("word"); p.set_defaults(fn=cmd_forget)
     a = ap.parse_args(argv)

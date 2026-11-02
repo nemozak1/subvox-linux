@@ -103,7 +103,8 @@ SOFA azimuth is counter-clockwise from the front, 0–360. Nothing is installed 
 attitude quaternion from each frame (`--gyro` integrates the gyro with gravity correction instead)
 and every 100 ms asks where the two room-fixed ±30° speakers are seen from the head, pushing their
 Azimuth/Elevation to the sink through a long-lived `pw-cli`. The reference frame slides back to the current pose while the head
-is still (`--recentre 6` s time constant, `c` recentres at once), as Apple's does. Regenerating
+is still (`--recentre 6` s time constant), as Apple's does; `c` or `python3 -m subvox recentre` from
+another shell (SIGUSR1) makes where you look now the front at once. Regenerating
 the HRIRs at 10 Hz costs the filter-chain process ~0.6 % CPU. `--demo` sweeps yaw ±60° without
 the buds. A2DP adds ~150–250 ms, so it lags Apple's.
 
