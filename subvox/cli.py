@@ -5,6 +5,8 @@
   subvox evaluate [--features acc,rot,att] [--permutations 500]
   subvox decode [--features ...] [--max-distance 1.0] [--min-confidence 0.1]
   subvox record <condition>           motion.csv session like the Mac app's Record Session
+  subvox calibrate [--analyze file]   scripted head moves -> head-calibration.json for spatial
+  subvox spatial [--demo]             head-tracked spatial audio on the "Spatial (Powerbeats)" sink
   subvox list | subvox forget <word>
 """
 
@@ -28,6 +30,8 @@ from .capture import CaptureController
 from .classifier import Template, TemplateClassifier, evaluate
 from .features import FeatureSet, energy
 from .motion import HeadphoneMotion, MotionSample, connected_device
+from . import calibrate as calib
+from . import spatial as sp
 
 
 class Keys:
@@ -257,6 +261,121 @@ def cmd_decode(a: argparse.Namespace) -> None:
     print("\ntranscript:", " ".join(transcript))
 
 
+def cmd_calibrate(a: argparse.Namespace) -> None:
+    if a.analyze:
+        rows = calib.read_recording(Path(a.analyze))
+    else:
+        q: queue.Queue = queue.Queue()
+        stop = threading.Event()
+        motion = motion_thread(resolve_mac(a.mac), q, stop)
+        total = sum(sec for _, _, sec in calib.PHASES)
+        print(f"{len(calib.PHASES)} prompts, {total} s. Wear the buds, face where the music should come from.")
+        input("Press Enter to start ...")
+        rows: list[dict] = []
+        phase = "start"
+        t_end = time.monotonic()
+        try:
+            for label, text, secs in calib.PHASES:
+                print(f"\n>> {text}")
+                t_end = time.monotonic() + secs
+                phase = label
+                while time.monotonic() < t_end:
+                    try:
+                        s = q.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    if s is None:
+                        sys.exit("stream ended")
+                    rows.append({"t": f"{s.t:.4f}", "phase": phase, "counter": s.counter,
+                                 "o0": s.raw_orient[0], "o1": s.raw_orient[1], "o2": s.raw_orient[2], "o3": s.raw_orient[3],
+                                 "gx": s.raw_gyro[0], "gy": s.raw_gyro[1], "gz": s.raw_gyro[2],
+                                 "ax": s.raw_accel[0], "ay": s.raw_accel[1], "az": s.raw_accel[2]})
+                    status_line(f"   {phase:11} {t_end - time.monotonic():4.1f} s  {motion.sample_rate:4.1f} Hz  "
+                                f"orient {s.raw_orient}  gyro {s.raw_gyro}")
+        finally:
+            stop.set()
+        print()
+        rec = calib.RECORDINGS_DIR / f"{datetime.now():%Y%m%d-%H%M%S}.csv"
+        calib.write_recording(rows, rec)
+        print(f"recorded {len(rows)} frames to {rec}")
+    cal, report = calib.analyze(rows)
+    print(report)
+    if a.analyze and not a.save:
+        print("\n(--save to write head-calibration.json)")
+        return
+    cal.save()
+    print(f"\nsaved {calib.CALIBRATION_PATH}")
+
+
+def cmd_spatial(a: argparse.Namespace) -> None:
+    node = sp.find_node()
+    if node is None:
+        sys.exit("sink 'subvox_spatial' not found; run tools/install-spatial.sh")
+    control = sp.SpatializerControl(node)
+    renderer = sp.StageRenderer(control, spread=a.spread, smooth_tau=a.smooth, elevation=not a.no_elevation)
+    period = 1.0 / a.rate
+    if a.demo:
+        tracker = sp.DemoTracker()
+        cpu0, t0 = sp.filter_chain_cpu(), time.monotonic()
+        print(f"demo: sweeping yaw ±60° into sink {node} at {a.rate:.0f} Hz; Ctrl-C to stop")
+        try:
+            while True:
+                pose = tracker.tick()
+                renderer.update(tracker, time.monotonic())
+                cpu = sp.filter_chain_cpu()
+                load = (cpu - cpu0) / (time.monotonic() - t0) * 100 if cpu is not None and cpu0 is not None else float("nan")
+                status_line(f"yaw {pose.yaw:+6.1f}°  FL {renderer.state['spFL'][0]:6.1f}° FR {renderer.state['spFR'][0]:6.1f}°  "
+                            f"updates {renderer.updates}  filter-chain CPU {load:4.1f} %")
+                time.sleep(period)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            renderer.reset(); control.close(); print()
+        return
+
+    cal = calib.HeadCalibration.load()
+    src = "calibrated" if cal.up else "uncalibrated: first second at rest defines up, yaw only is trustworthy"
+    tracker = sp.HeadTracker(cal, recentre_tau=a.recentre)
+    q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    motion = motion_thread(resolve_mac(a.mac), q, stop)
+    print(f"spatial: sink {node}, {src}; keys: c recentre, q quit")
+    next_tick = time.monotonic()
+    pose = None
+    try:
+        with Keys() as keys:
+            while True:
+                try:
+                    s = q.get(timeout=0.05)
+                    if s is None:
+                        print("\nstream ended"); break
+                    pose = tracker.update(s) or pose
+                except queue.Empty:
+                    pass
+                k = keys.poll()
+                if k == "q":
+                    break
+                if k == "c":
+                    tracker.recentre()
+                now = time.monotonic()
+                if now >= next_tick and tracker.ready:
+                    next_tick = now + period
+                    renderer.update(tracker, now)
+                    if pose:
+                        st = renderer.state
+                        status_line(f"{motion.sample_rate:4.1f} Hz  yaw {pose.yaw:+6.1f}° pitch {pose.pitch:+5.1f}° roll {pose.roll:+5.1f}°  "
+                                    f"{'still ' if pose.still else 'moving'} {pose.rate:5.1f}°/s  "
+                                    f"FL {st['spFL'][0]:5.1f}°/{st['spFL'][1]:+5.1f}°  FR {st['spFR'][0]:5.1f}°/{st['spFR'][1]:+5.1f}°  "
+                                    f"sent {renderer.updates}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        renderer.reset()
+        control.close()
+        print()
+
+
 def cmd_list(a: argparse.Namespace) -> None:
     templates = store.load()
     if not templates:
@@ -289,6 +408,14 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("decode"); p.add_argument("--features", default="all")
     p.add_argument("--max-distance", type=float, default=1.0); p.add_argument("--min-confidence", type=float, default=0.1)
     p.set_defaults(fn=cmd_decode)
+    p = sub.add_parser("calibrate"); p.add_argument("--analyze", metavar="CSV", help="re-analyse a recording instead of recording")
+    p.add_argument("--save", action="store_true", help="with --analyze: write head-calibration.json"); p.set_defaults(fn=cmd_calibrate)
+    p = sub.add_parser("spatial"); p.add_argument("--demo", action="store_true", help="sweep yaw without the buds (load test)")
+    p.add_argument("--rate", type=float, default=10.0, help="control updates per second")
+    p.add_argument("--spread", type=float, default=30.0, help="speaker half-angle, degrees")
+    p.add_argument("--smooth", type=float, default=0.1, help="smoothing time constant, s")
+    p.add_argument("--recentre", type=float, default=6.0, help="recentre time constant when still, s (0 = never)")
+    p.add_argument("--no-elevation", action="store_true"); p.set_defaults(fn=cmd_spatial)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     p = sub.add_parser("forget"); p.add_argument("word"); p.set_defaults(fn=cmd_forget)
     a = ap.parse_args(argv)

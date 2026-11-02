@@ -73,6 +73,7 @@ class HeadCalibration:
 
     gyro_rad_per_lsb: float = 1e-3
     gyro_bias: Vec = (0.0, 0.0, 0.0)
+    gyro_sign: int = 1             # -1 if the gyro frame is left-handed w.r.t. the accelerometer
     up: Vec | None = None          # sensor-frame unit vectors with the head centred
     left: Vec | None = None
     forward: Vec | None = None
@@ -86,7 +87,7 @@ class HeadCalibration:
         with open(path) as f:
             d = json.load(f)
         c = cls(gyro_rad_per_lsb=d.get("gyro_rad_per_lsb", 1e-3), gyro_bias=tuple(d.get("gyro_bias", (0, 0, 0))),
-                orient=d.get("orient", {}), notes=d.get("notes", []))
+                gyro_sign=int(d.get("gyro_sign", 1)), orient=d.get("orient", {}), notes=d.get("notes", []))
         for k in ("up", "left", "forward"):
             if d.get(k):
                 setattr(c, k, tuple(d[k]))
@@ -94,7 +95,7 @@ class HeadCalibration:
 
     def save(self, path: Path = CALIBRATION_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        d = {"gyro_rad_per_lsb": self.gyro_rad_per_lsb, "gyro_bias": list(self.gyro_bias),
+        d = {"gyro_rad_per_lsb": self.gyro_rad_per_lsb, "gyro_bias": list(self.gyro_bias), "gyro_sign": self.gyro_sign,
              "up": list(self.up) if self.up else None, "left": list(self.left) if self.left else None,
              "forward": list(self.forward) if self.forward else None, "orient": self.orient, "notes": self.notes}
         with open(path, "w") as f:
@@ -209,9 +210,10 @@ def analyze(rows: list[dict]) -> tuple[HeadCalibration, str]:
         d = _dot(yaw_axis, up)
         out.append(f"yaw axis · up = {d:+.3f} (±1 is ideal; + means a left turn is a positive rotation about up)")
         if d < 0:
-            cal.notes.append("left turn is a negative rotation about measured up: left-handed gyro frame, yaw sign flipped")
+            cal.gyro_sign = -1
+            cal.notes.append("left turn is a negative rotation about measured up: gyro frame treated as left-handed")
     if "up" in holds and "down" in holds:
-        nod = [a - b for a, b in zip(holds["down"]["rot"], holds["up"]["rot"])]   # down minus up
+        nod = [cal.gyro_sign * (a - b) for a, b in zip(holds["down"]["rot"], holds["up"]["rot"])]   # down minus up
         # x forward, y left, z up: a positive rotation about +left tips the nose down.
         left = _norm(nod)
         left = _norm([l - _dot(left, up) * u for l, u in zip(left, up)])  # orthogonalise against up
@@ -220,7 +222,7 @@ def analyze(rows: list[dict]) -> tuple[HeadCalibration, str]:
         out.append(f"left axis (sensor frame): {tuple(round(x, 3) for x in left)}   "
                    f"forward: {tuple(round(x, 3) for x in cal.forward)}   left·up = {_dot(left, up):+.3f}")
         if "tilt_left" in holds and "tilt_right" in holds:
-            roll_axis = _norm([a - b for a, b in zip(holds["tilt_right"]["rot"], holds["tilt_left"]["rot"])])
+            roll_axis = _norm([cal.gyro_sign * (a - b) for a, b in zip(holds["tilt_right"]["rot"], holds["tilt_left"]["rot"])])
             out.append(f"roll axis · forward = {_dot(roll_axis, cal.forward):+.3f} (+1 is ideal)")
 
     # Orientation words: which one moves with which rotation, and by how much per degree.

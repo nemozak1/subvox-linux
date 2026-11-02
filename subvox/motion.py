@@ -238,8 +238,13 @@ class HeadphoneMotion:
 
 
 def connected_device() -> str | None:
-    """MAC of the single connected Bluetooth device, via bluetoothctl."""
+    """MAC of the connected earbuds, via bluetoothctl: the single connected device, or the
+    single connected one that offers an A2DP Audio Sink (keyboards and mice don't)."""
     import subprocess
     out = subprocess.run(["bluetoothctl", "devices", "Connected"], capture_output=True, text=True).stdout
     macs = [line.split()[1] for line in out.splitlines() if line.startswith("Device ")]
-    return macs[0] if len(macs) == 1 else None
+    if len(macs) == 1:
+        return macs[0]
+    audio = [m for m in macs if "Audio Sink" in
+             subprocess.run(["bluetoothctl", "info", m], capture_output=True, text=True).stdout]
+    return audio[0] if len(audio) == 1 else None

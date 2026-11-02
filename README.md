@@ -95,3 +95,20 @@ tools/install-spatial.sh --remove
 
 The spatializer controls are live: `pw-cli set-param <sink id> Props '{ params = [ "spFL:Azimuth" 60.0 ] }'`.
 SOFA azimuth is counter-clockwise from the front, 0–360. Nothing is installed system-wide.
+
+**Head tracking** (`subvox/spatial.py`): `python3 -m subvox spatial` integrates the gyro into a
+quaternion, pulls pitch/roll back to the accelerometer's gravity, and every 100 ms asks where the
+two room-fixed ±30° speakers are seen from the head, pushing their Azimuth/Elevation to the sink
+through a long-lived `pw-cli`. The reference frame slides back to the current pose while the head
+is still (`--recentre 6` s time constant, `c` recentres at once), as Apple's does. Regenerating
+the HRIRs at 10 Hz costs the filter-chain process ~0.6 % CPU. `--demo` sweeps yaw ±60° without
+the buds. A2DP adds ~150–250 ms, so it lags Apple's.
+
+**Calibration** (`subvox/calibrate.py`): `python3 -m subvox calibrate` prompts 13 timed moves
+(still, left/right 90°, up/down, tilt) and records raw frames to
+`~/.local/share/subvox/calibration/<timestamp>.csv`, then derives the gyro scale (from the
+gravity-measured tilts, cross-checked against the 90° turns), the head's up/left/forward axes in
+the sensor frame, the gyro handedness, and which of the four orientation words track yaw / pitch /
+roll. It writes `~/.local/share/subvox/head-calibration.json`, which `spatial` loads.
+`--analyze <csv> [--save]` re-runs the analysis on a recording. Uncalibrated, `spatial` takes
+"up" from the first second at rest and trusts yaw only.
