@@ -8,6 +8,11 @@ seen from the head? -> pw-cli set-param on the filter-chain sink's spatializer c
 
 Like Apple's head tracking the reference frame drifts back to wherever the head has been
 pointing for a while, so looking away briefly moves the stage and settling in recentres it.
+
+Latency: the A2DP sink buffers ~214 ms and the graph quantum adds ~21 ms, so a control change is
+heard ~240 ms late. The renderer therefore aims the speakers at where the head will be `lead`
+seconds from now, extrapolated from the smoothed body angular velocity. Overshoot when the head
+stops is bounded by |ω|·lead and decays within one lead time.
 """
 
 from __future__ import annotations
@@ -130,6 +135,8 @@ class HeadTracker:
         self._boot_acc: list[Vec] = []
         self.ready = self.up is not None
         self.rate = 0.0
+        self.omega: Vec = (0.0, 0.0, 0.0)   # body angular velocity, rad/s, EMA (tau omega_tau)
+        self.omega_tau = 0.06
         # Online gyro scale: angle the gravity vector turned through vs. the raw gyro integral
         # over the same window. Robust median of many nods/tilts. Off when the file is calibrated.
         self.auto_scale = cal.up is None
@@ -174,8 +181,14 @@ class HeadTracker:
             self._t_prev = s.t
             if not 0 < dt < 0.5:
                 return None
-            dq = qmul(q, qconj(self.q))
-            self.rate = 2 * math.acos(min(1.0, abs(dq[0]))) / dt
+            dq = qmul(qconj(self.q), q)          # body-frame rotation since the last frame
+            if dq[0] < 0:
+                dq = tuple(-x for x in dq)
+            ang = 2 * math.acos(min(1.0, dq[0]))
+            s_half = math.sqrt(max(0.0, 1 - dq[0] * dq[0]))
+            w_body = tuple(x / s_half * ang / dt for x in dq[1:]) if s_half > 1e-9 else (0.0, 0.0, 0.0)
+            self.rate = ang / dt
+            self._smooth_omega(w_body, dt)
             self.q = q
         else:
             if self._t_prev is None:
@@ -191,6 +204,7 @@ class HeadTracker:
                 self._learn_scale(s.t, norm(a), raw, dt)
             w = tuple(c.gyro_sign * r * self.scale for r in raw)
             self.rate = math.sqrt(dot(w, w))
+            self._smooth_omega(w, dt)
             # integrate body rates
             self.q = qnorm(qmul(self.q, qfrom_rotvec(tuple(x * dt for x in w))))
             # gravity pulls pitch/roll back when the accelerometer reads ~1 g
@@ -236,9 +250,22 @@ class HeadTracker:
                 self.scale = sorted(self.scale_estimates)[len(self.scale_estimates) // 2]
         self._win.clear()
 
+    def _smooth_omega(self, w: Vec, dt: float) -> None:
+        k = 1.0 - math.exp(-dt / self.omega_tau)
+        self.omega = tuple(o + k * (x - o) for o, x in zip(self.omega, w))
+
     # -- readouts
-    def q_rel(self) -> Quat:
-        return qmul(qconj(self.q_ref), self.q)
+    def q_rel(self, lead: float = 0.0) -> Quat:
+        """Head pose relative to the reference, extrapolated `lead` seconds ahead."""
+        q = self.q
+        if lead > 0:
+            rv = tuple(x * lead for x in self.omega)
+            mag = math.sqrt(dot(rv, rv))
+            cap = math.radians(45)
+            if mag > cap:
+                rv = tuple(x * cap / mag for x in rv)
+            q = qnorm(qmul(q, qfrom_rotvec(rv)))
+        return qmul(qconj(self.q_ref), q)
 
     def pose(self, still: bool = False) -> Pose:
         qr = self.q_rel()
@@ -249,12 +276,13 @@ class HeadTracker:
         roll = math.degrees(math.asin(max(-1.0, min(1.0, dot(lf, self.up)))))
         return Pose(yaw, pitch, roll, still, math.degrees(self.rate))
 
-    def speaker_direction(self, azimuth_deg: float, elevation_deg: float = 0.0) -> tuple[float, float]:
-        """Where a room-fixed source at (az, el) is, seen from the head: (azimuth 0-360, elevation)."""
+    def speaker_direction(self, azimuth_deg: float, elevation_deg: float = 0.0, lead: float = 0.0) -> tuple[float, float]:
+        """Where a room-fixed source at (az, el) is, seen from the head `lead` s from now:
+        (azimuth 0-360, elevation)."""
         az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
         s_ref = tuple(math.cos(el) * (math.cos(az) * f + math.sin(az) * l) + math.sin(el) * u
                       for f, l, u in zip(self.forward, self.left, self.up))
-        s_dev = qrot(qconj(self.q_rel()), s_ref)
+        s_dev = qrot(qconj(self.q_rel(lead)), s_ref)
         az_d = math.degrees(math.atan2(dot(s_dev, self.left), dot(s_dev, self.forward))) % 360.0
         el_d = math.degrees(math.asin(max(-1.0, min(1.0, dot(s_dev, self.up)))))
         return az_d, el_d
@@ -311,10 +339,11 @@ class SpatializerControl:
 class StageRenderer:
     """Smooths and rate-limits the per-speaker azimuth/elevation and pushes changes."""
 
-    def __init__(self, control: SpatializerControl, spread: float = 30.0, smooth_tau: float = 0.1,
-                 min_change: float = 0.25, elevation: bool = True) -> None:
+    def __init__(self, control: SpatializerControl, spread: float = 30.0, smooth_tau: float = 0.04,
+                 min_change: float = 0.2, elevation: bool = True, lead: float = 0.2) -> None:
         self.control = control
         self.spread = spread
+        self.lead = lead
         self.smooth_tau = smooth_tau
         self.min_change = min_change
         self.elevation = elevation
@@ -330,7 +359,7 @@ class StageRenderer:
         changed = False
         values: dict[str, float] = {}
         for name, sign in SPEAKERS.items():
-            az, el = tracker.speaker_direction(sign * self.spread)
+            az, el = tracker.speaker_direction(sign * self.spread, lead=self.lead)
             if not self.elevation:
                 el = 0.0
             paz, pel = self.state[name]
