@@ -9,7 +9,13 @@ if [[ "${1:-}" == "--remove" ]]; then
   rm -f "$dst"; systemctl --user restart filter-chain; echo removed; exit 0
 fi
 mkdir -p "$(dirname "$dst")"
-cp "$here/spatial/subvox-spatial.conf" "$dst"
+hrtf=~/.local/share/subvox/hrtf/HRIR_L2702.sofa
+if [[ ! -f "$hrtf" ]]; then
+  mkdir -p "$(dirname "$hrtf")"
+  echo "downloading KU100 HRTF (3.3 MB) ..."
+  curl -fsSL -o "$hrtf" "https://sofacoustics.org/data/database/thk/HRIR_L2702.sofa"
+fi
+sed "s|@HRTF@|$hrtf|g" "$here/spatial/subvox-spatial.conf" > "$dst"
 systemctl --user restart filter-chain
 for _ in $(seq 1 20); do
   id=$(pw-dump 2>/dev/null | python3 -I -c 'import json,sys
