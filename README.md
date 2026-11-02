@@ -76,3 +76,22 @@ Same as the Mac app, plus:
 - Gyro units are approximate (`GYRO_RAD_PER_LSB` in `motion.py`).
 - One connected device at a time; pass `--mac` if several are connected.
 - Terminal UI: Space toggles capture rather than hold-to-capture.
+
+## Head-tracked spatial audio (`subvox spatial`)
+
+Uses the same motion stream to do what Apple's Spatial Audio with head tracking does, on
+PipeWire. Verified 2026-11-02 with Powerbeats Pro 2 on PipeWire 1.6.2 (Ubuntu), AAC A2DP.
+
+**Renderer** (`spatial/subvox-spatial.conf`): a filter-chain sink "Spatial (Powerbeats)" whose
+FL/FR channels feed two `sofa` spatializers (libmysofa, MIT KEMAR HRTF from the `libmysofa1`
+package) at azimuth 30° / 330°, mixed to binaural stereo and sent to the buds
+(`bluez_output.<mac>`). It lives in `~/.config/pipewire/filter-chain.conf.d/` and runs in the
+user `filter-chain.service`, so it restarts on its own without touching the main daemon:
+
+```sh
+tools/install-spatial.sh          # copy config, restart filter-chain, make it the default sink
+tools/install-spatial.sh --remove
+```
+
+The spatializer controls are live: `pw-cli set-param <sink id> Props '{ params = [ "spFL:Azimuth" 60.0 ] }'`.
+SOFA azimuth is counter-clockwise from the front, 0–360. Nothing is installed system-wide.
