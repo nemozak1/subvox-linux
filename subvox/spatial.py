@@ -137,6 +137,8 @@ class HeadTracker:
         self.rate = 0.0
         self.omega: Vec = (0.0, 0.0, 0.0)   # body angular velocity, rad/s, EMA (tau omega_tau)
         self.omega_tau = 0.06
+        self._n = 0                           # valid quaternion frames seen; the first few can be stale
+        self.ref_set = False                  # reference taken from a settled pose yet?
         # Online gyro scale: angle the gravity vector turned through vs. the raw gyro integral
         # over the same window. Robust median of many nods/tilts. Off when the file is calibrated.
         self.auto_scale = cal.up is None
@@ -156,6 +158,7 @@ class HeadTracker:
 
     def recentre(self) -> None:
         self.q_ref = self.q
+        self.ref_set = True
 
     # -- update
     def update(self, s: MotionSample) -> Pose | None:
@@ -173,7 +176,8 @@ class HeadTracker:
             q = quat_from_words(*s.raw_orient[:3])
             if q is None:
                 return None
-            if self._t_prev is None:
+            self._n += 1
+            if self._t_prev is None or self._n <= 5:   # the first frames after START can be stale
                 self.q = self.q_ref = q
                 self._t_prev = s.t
                 return None
@@ -188,6 +192,10 @@ class HeadTracker:
             s_half = math.sqrt(max(0.0, 1 - dq[0] * dq[0]))
             w_body = tuple(x / s_half * ang / dt for x in dq[1:]) if s_half > 1e-9 else (0.0, 0.0, 0.0)
             self.rate = ang / dt
+            if self.rate > math.radians(720):     # a stale frame, not a head: ignore it
+                self.rate = 0.0
+                self.q = q
+                return None
             self._smooth_omega(w_body, dt)
             self.q = q
         else:
@@ -222,7 +230,10 @@ class HeadTracker:
         else:
             self._still_since = None
         still = self._still_since is not None and now - self._still_since >= self.still_after
-        if still and self.recentre_tau > 0:
+        if still and not self.ref_set:           # first settled pose after start is the front
+            self.q_ref = self.q
+            self.ref_set = True
+        elif still and self.recentre_tau > 0:
             self.q_ref = qslerp(self.q_ref, self.q, min(1.0, dt / self.recentre_tau))
 
         return self.pose(still)

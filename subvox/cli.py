@@ -440,7 +440,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--lead", type=float, default=0.2, help="aim at the head pose this far ahead, s (A2DP ~0.21 + quantum 0.02; 0 = off)")
     p.add_argument("--recentre", type=float, default=6.0, help="recentre time constant when still, s (0 = never)")
     p.add_argument("--gyro", action="store_true", help="integrate the gyro instead of using the attitude quaternion")
-    p.add_argument("--deadband", type=float, default=1.0, help="only send when a speaker moved this many degrees")
+    p.add_argument("--deadband", type=float, default=1.5, help="only send when a speaker moved this many degrees")
     p.add_argument("--no-elevation", action="store_true"); p.set_defaults(fn=cmd_spatial)
     sub.add_parser("recentre").set_defaults(fn=cmd_recentre)
     sub.add_parser("list").set_defaults(fn=cmd_list)
