@@ -71,6 +71,8 @@ def motion_thread(mac: str, q: "queue.Queue[MotionSample | None]", stop: threadi
                 q.put(s)
                 if stop.is_set():
                     break
+        except OSError:
+            pass                      # the buds reset AAP when A2DP reconnects; the caller reopens
         finally:
             motion.stop()
             q.put(None)
@@ -342,23 +344,42 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     src = ("calibrated" if cal.up else "uncalibrated: first second at rest defines up, yaw only is right") + \
           (", gyro integration" if a.gyro else ", buds' attitude quaternion")
     tracker = sp.HeadTracker(cal, recentre_tau=a.recentre, use_quaternion=not a.gyro)
-    q: queue.Queue = queue.Queue()
-    stop = threading.Event()
-    motion = motion_thread(resolve_mac(a.mac), q, stop)
     print(f"spatial: sink {node}, {src}; keys: c recentre, q quit; `subvox recentre` from another shell")
     signal.signal(signal.SIGUSR1, lambda *_: tracker.recentre())
     import os
     calib.CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
     SPATIAL_PID.write_text(str(os.getpid()))
+    q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    motion = None
+    retry_at = 0.0
     next_tick = time.monotonic()
+    next_check = time.monotonic() + 10
     pose = None
     try:
         with Keys() as keys:
             while True:
+                now = time.monotonic()
+                if motion is None and now >= retry_at:
+                    # (Re)open the motion stream. The buds reset AAP when A2DP reconnects.
+                    mac = a.mac or connected_device()
+                    try:
+                        if not mac:
+                            raise OSError("buds not connected")
+                        motion = motion_thread(mac, q, stop)
+                        tracker.ref_set = False      # take a fresh front once still
+                        status_line("motion stream open")
+                    except OSError as e:
+                        status_line(f"motion: {e}; retrying in 3 s")
+                        retry_at = now + 3
                 try:
                     s = q.get(timeout=0.05)
                     if s is None:
-                        print("\nstream ended"); break
+                        status_line("motion stream ended; reconnecting")
+                        motion = None
+                        retry_at = time.monotonic() + 2
+                        renderer.reset()
+                        continue
                     pose = tracker.update(s) or pose
                 except queue.Empty:
                     pass
@@ -368,7 +389,14 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                 if k == "c":
                     tracker.recentre()
                 now = time.monotonic()
-                if now >= next_tick and tracker.ready:
+                if now >= next_check:
+                    # the sink node is recreated with a new id if the filter-chain restarts
+                    next_check = now + 10
+                    nid = sp.find_node()
+                    if nid is not None and nid != control.node_id:
+                        control.node_id = nid
+                        renderer.last_sent = {k: (-999.0, -999.0) for k in sp.SPEAKERS}
+                if now >= next_tick and tracker.ready and motion is not None:
                     next_tick = now + period
                     renderer.update(tracker, now)
                     if pose:
