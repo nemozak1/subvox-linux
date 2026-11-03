@@ -26,7 +26,7 @@ from gi.repository import Gdk, GLib, Gtk, GtkLayerShell  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-from subvox.settings import LIMITS, Settings  # noqa: E402
+from subvox.settings import LIMITS, Settings, read_status  # noqa: E402
 
 PID_FILE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "subvox/settings-popup.pid"
 BAR_CONFIG = Path.home() / ".config/athanor/waybar/config.jsonc"
@@ -96,6 +96,10 @@ class Popup(Gtk.Window):
         grid.attach(self.power, 2, row, 1, 1); row += 1
         sub = Gtk.Label(label="off = plain stereo straight to the buds", xalign=0); sub.get_style_context().add_class("hint")
         grid.attach(sub, 0, row, 3, 1); row += 1
+        self.status = Gtk.Label(label="", xalign=0, wrap=True, max_width_chars=42)
+        self.status.get_style_context().add_class("hint")
+        grid.attach(self.status, 0, row, 3, 1); row += 1
+        grid.attach(Gtk.Separator(), 0, row, 3, 1); row += 1
 
         self.spins: dict[str, Gtk.SpinButton] = {}
         for key, label, hint, step, digits in FIELDS:
@@ -148,6 +152,15 @@ class Popup(Gtk.Window):
         return False
 
     def refresh(self) -> bool:
+        st = read_status()
+        if st.get("stream") == "open":
+            self.status.set_text(f"tracking {st.get('hz', 0):.0f} Hz · yaw {st.get('yaw', 0):+.0f}° "
+                                 f"pitch {st.get('pitch', 0):+.0f}° roll {st.get('roll', 0):+.0f}° · "
+                                 f"{'still' if st.get('still') else 'moving'} · {st.get('sent', 0)} updates")
+        elif st.get("stream") == "stopped":
+            self.status.set_text("daemon not running" if self.settings["enabled"] else "off")
+        else:
+            self.status.set_text("daemon up, waiting for the buds' motion stream")
         # keep the power switch honest if it was toggled from the bar meanwhile
         if self.settings.reload():
             for key, spin in self.spins.items():
