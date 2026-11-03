@@ -193,11 +193,13 @@ class HeadTracker:
                 # World up = where the quaternion puts gravity; average the first second.
                 if 0.8 < a_mag < 1.2:
                     self._grav_w.append(qrot(q, norm(a)))
-                if len(self._grav_w) >= 25:
-                    self.W = norm(tuple(sum(v[i] for v in self._grav_w) / len(self._grav_w) for i in range(3)))
-                    self.ready = True
                 self.q = q
                 self._t_prev = s.t
+                if len(self._grav_w) >= 25:
+                    self.W = norm(tuple(sum(v[i] for v in self._grav_w) / len(self._grav_w) for i in range(3)))
+                    self.recentre()               # provisional front; the first still pose replaces it
+                    self.ref_set = False
+                    self.ready = True
                 return None
             dt = s.t - self._t_prev
             self._t_prev = s.t
@@ -302,6 +304,8 @@ class HeadTracker:
         return qnorm(qmul(self.q, qfrom_rotvec(rv)))
 
     def pose(self, still: bool = False) -> Pose:
+        if self.f_ref is None:
+            self.recentre()
         f_w = self.forward_world(self.q)
         fwd, left, up = self.head_axes(self.q)
         l_ref = cross(self.W, self.f_ref)                       # reference left, world frame
@@ -320,6 +324,8 @@ class HeadTracker:
         """Where a stage-fixed source at (az, el) is, seen from the head `lead` s from now:
         (azimuth 0-360 counter-clockwise from the nose, elevation)."""
         az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
+        if self.f_ref is None:
+            self.recentre()
         l_ref = cross(self.W, self.f_ref)
         s_w = tuple(math.cos(el) * (math.cos(az) * f + math.sin(az) * l) + math.sin(el) * w
                     for f, l, w in zip(self.f_ref, l_ref, self.W))
