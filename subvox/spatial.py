@@ -383,6 +383,10 @@ class SpatializerControl:
                 self.proc.wait(timeout=2)
             except (OSError, subprocess.TimeoutExpired):
                 self.proc.kill()
+            try:
+                self.proc.stdin.close()   # else the wrapper flushes into a dead pipe at exit
+            except OSError:
+                pass
 
 
 class StageRenderer:
