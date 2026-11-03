@@ -371,6 +371,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     stop = threading.Event()
     motion = None
     stream_state = "connecting"
+    last_sample = time.monotonic()
     retry_at = 0.0
     next_tick = time.monotonic()
     next_check = time.monotonic() + 10
@@ -389,6 +390,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                         motion = motion_thread(mac, q, stop)
                         tracker.ref_set = False      # take a fresh front once still
                         stream_state = "open"
+                        last_sample = time.monotonic()
                         status_line("motion stream open")
                     except OSError as e:
                         stream_state = "reconnecting"
@@ -404,8 +406,19 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                         renderer.reset()
                         continue
                     pose = tracker.update(s) or pose
+                    last_sample = time.monotonic()
                 except queue.Empty:
                     pass
+                if motion is not None and time.monotonic() - last_sample > 2.0:
+                    # Socket still open but no frames: the buds stop the motion service when they
+                    # leave the ears and need a fresh START. Closing the socket ends the reader
+                    # thread, which queues None, and the reconnect path above reopens it.
+                    status_line("no motion frames for 2 s; restarting the stream")
+                    motion.stop()
+                    motion = None
+                    stream_state = "reconnecting"
+                    retry_at = time.monotonic() + 1
+                    renderer.reset()
                 k = keys.poll()
                 if k == "q":
                     break
