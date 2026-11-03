@@ -17,6 +17,7 @@ STATUS_PATH = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"
 
 DEFAULTS: dict = {
     "enabled": False,     # desired state; `subvox ctl on/off` keeps the audio graph in step
+    "tracking": True,     # with enabled: move the stage with the head (daemon) or leave it static
     "linger": 6.0,        # s: time constant for the stage to drift back to where you face (0 = never)
     "lead": 0.2,          # s: aim at the head pose this far ahead (A2DP ~0.21 + quantum 0.02)
     "deadband": 1.5,      # °: only rebuild the HRIRs when a speaker moved this much

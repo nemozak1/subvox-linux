@@ -1,7 +1,9 @@
 """`subvox ctl`: switch head-tracked spatial audio on and off and edit its settings.
 
-  subvox ctl on|off|toggle      start/stop the daemon (user service), make the spatial sink or
-                                the buds the default output and move playing streams across
+  subvox ctl on|off|toggle      spatial render on (sink default, streams moved onto it) or off
+                                (buds default, plain stereo); on starts the daemon if tracking is set
+  subvox ctl track on|off       head tracking on (daemon follows the head) or off (static stage)
+  subvox ctl mode off|spatial|tracked   both at once
   subvox ctl status [--json]    settings + daemon state + where the audio goes
   subvox ctl set <key> <value>  linger, lead, deadband, spread, elevation, rate (daemon reloads)
   subvox ctl linger +1|-1|<s>   nudge or set the linger time
@@ -152,21 +154,59 @@ def ensure_sink(timeout: float = 8.0) -> int | None:
     return g["spatial"]
 
 
+def static_stage(sink: int, spread: float) -> None:
+    """Put the speakers back at ±spread, level, for a render without tracking."""
+    params = f'"spFL:Azimuth" {spread % 360:.2f} "spFL:Elevation" 0.0 "spFR:Azimuth" {(-spread) % 360:.2f} "spFR:Elevation" 0.0'
+    try:
+        p = subprocess.Popen(["pw-cli"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+        time.sleep(0.6)
+        p.stdin.write(f"set-param {sink} Props {{ params = [ {params} ] }}\n"); p.stdin.flush()
+        time.sleep(0.4)
+        p.stdin.write("quit\n"); p.stdin.flush()
+        p.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def on() -> None:
     if not UNIT_PATH.exists():
         install()
     s = Settings(); s.set("enabled", True); s.save()
     stray_daemon_stop()
-    systemctl("enable", "--now", SERVICE)
     sink = ensure_sink()
     if sink is None:
         sys.exit("spatial sink did not appear; check `systemctl --user status filter-chain`")
+    if s["tracking"]:
+        systemctl("enable", "--now", SERVICE)
+    else:
+        systemctl("disable", "--now", SERVICE)
+        static_stage(sink, s["spread"])
     g = graph()
     set_default(sink)
     for st in g["streams"]:
         if g["buds"] in g["feeds"][st] or not g["feeds"][st]:
             retarget(st, SINK)
-    print(f"spatial on: default sink {SINK}, daemon {'running' if service_active() else 'starting'}")
+    how = ("tracked, daemon " + ("running" if service_active() else "starting")) if s["tracking"] else "static stage"
+    print(f"spatial on: default sink {SINK}, {how}")
+
+
+def track(flag: str) -> None:
+    s = Settings(); s.set("tracking", flag); s.save()
+    if s["enabled"]:
+        on()
+    else:
+        print(f"tracking {'on' if s['tracking'] else 'off'} (stage is off)")
+
+
+def mode(which: str) -> None:
+    if which == "off":
+        off()
+    elif which in ("spatial", "static"):
+        track("off")
+    elif which == "tracked":
+        track("on")
+    else:
+        sys.exit("mode: off | spatial | tracked")
 
 
 def off() -> None:
@@ -196,7 +236,9 @@ def stray_daemon_stop() -> None:
 
 
 def toggle() -> None:
-    if Settings()["enabled"] and service_active():
+    s = Settings()
+    running_ok = service_active() if s["tracking"] else True
+    if s["enabled"] and running_ok:
         off()
     else:
         on()
@@ -215,8 +257,8 @@ def status(as_json: bool) -> None:
     if as_json:
         print(json.dumps(d))
         return
-    on_ = s["enabled"] and d["service"]
-    print(f"spatial: {'on' if on_ else 'off'}  (service {'active' if d['service'] else 'inactive'}, "
+    on_ = s["enabled"] and (d["service"] or not s["tracking"])
+    print(f"spatial: {'on, ' + ('tracked' if s['tracking'] else 'static') if on_ else 'off'}  (service {'active' if d['service'] else 'inactive'}, "
           f"default sink {g['default']}, buds {'connected, ' + str(g['codec']) if g['buds'] is not None else 'not connected'})")
     if st.get("stream") != "stopped":
         print(f"daemon: stream {st.get('stream')}  {st.get('hz', 0):.1f} Hz  yaw {st.get('yaw', 0):+.1f}° "
@@ -275,6 +317,8 @@ def main(argv: list[str]) -> None:
     if cmd == "on": on()
     elif cmd == "off": off()
     elif cmd == "toggle": toggle()
+    elif cmd == "track" and len(rest) == 1: track(rest[0])
+    elif cmd == "mode" and len(rest) == 1: mode(rest[0])
     elif cmd == "status": status("--json" in rest)
     elif cmd == "set" and len(rest) == 2: set_value(*rest)
     elif cmd == "linger" and len(rest) == 1: linger(rest[0])

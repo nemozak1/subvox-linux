@@ -99,6 +99,11 @@ class Popup(Gtk.Window):
         self.status = Gtk.Label(label="", xalign=0, wrap=True, max_width_chars=42)
         self.status.get_style_context().add_class("hint")
         grid.attach(self.status, 0, row, 3, 1); row += 1
+        self.track = Gtk.Switch(halign=Gtk.Align.END, active=self.settings["tracking"])
+        self.track.connect("notify::active", self.on_track)
+        grid.attach(Gtk.Label(label="Head tracking", xalign=0), 0, row, 1, 1); grid.attach(self.track, 2, row, 1, 1); row += 1
+        h = Gtk.Label(label="off = the stage stays in front of you wherever you look", xalign=0); h.get_style_context().add_class("hint")
+        grid.attach(h, 0, row, 3, 1); row += 1
         grid.attach(Gtk.Separator(), 0, row, 3, 1); row += 1
 
         self.spins: dict[str, Gtk.SpinButton] = {}
@@ -135,6 +140,9 @@ class Popup(Gtk.Window):
     def on_power(self, sw: Gtk.Switch, _p) -> None:
         ctl("on" if sw.get_active() else "off")
 
+    def on_track(self, sw: Gtk.Switch, _p) -> None:
+        ctl("track", "on" if sw.get_active() else "off")
+
     def on_spin(self, spin: Gtk.SpinButton, key: str) -> None:
         self.settings.set(key, spin.get_value()); self.settings.save()
 
@@ -158,7 +166,12 @@ class Popup(Gtk.Window):
                                  f"pitch {st.get('pitch', 0):+.0f}° roll {st.get('roll', 0):+.0f}° · "
                                  f"{'still' if st.get('still') else 'moving'} · {st.get('sent', 0)} updates")
         elif st.get("stream") == "stopped":
-            self.status.set_text("daemon not running" if self.settings["enabled"] else "off")
+            if not self.settings["enabled"]:
+                self.status.set_text("off: plain stereo")
+            elif not self.settings["tracking"]:
+                self.status.set_text("static stage, speakers at ±%.0f°" % self.settings["spread"])
+            else:
+                self.status.set_text("daemon not running")
         else:
             self.status.set_text("daemon up, waiting for the buds' motion stream")
         # keep the power switch honest if it was toggled from the bar meanwhile
@@ -166,9 +179,11 @@ class Popup(Gtk.Window):
             for key, spin in self.spins.items():
                 if abs(spin.get_value() - self.settings[key]) > 1e-9:
                     spin.set_value(self.settings[key])
-        want = self.settings["enabled"] and service_active()
+        want = self.settings["enabled"] and (service_active() or not self.settings["tracking"])
         if self.power.get_active() != want:
             self.power.handler_block_by_func(self.on_power); self.power.set_active(want); self.power.handler_unblock_by_func(self.on_power)
+        if self.track.get_active() != self.settings["tracking"]:
+            self.track.handler_block_by_func(self.on_track); self.track.set_active(self.settings["tracking"]); self.track.handler_unblock_by_func(self.on_track)
         return True
 
     def quit(self) -> None:

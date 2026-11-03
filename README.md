@@ -125,7 +125,8 @@ rest and gets yaw right but mixes pitch and roll.
 ```sh
 subvox ctl on        # user service subvox-spatial, spatial sink default, playing streams moved onto it
 subvox ctl off       # service stopped, buds default again (plain AAC stereo), streams moved back
-subvox ctl toggle | status | set linger 10 | linger +1 | recentre | settings | install
+subvox ctl track off # static stage: the spatial render without the daemon (speakers parked at ±spread)
+subvox ctl toggle | mode off|spatial|tracked | status | set linger 10 | linger +1 | recentre | settings | install
 ```
 
 `subvox ctl install` writes `~/.config/systemd/user/subvox-spatial.service` and the `~/.local/bin/subvox`
