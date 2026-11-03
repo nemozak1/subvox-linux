@@ -34,6 +34,9 @@ Quat = tuple[float, float, float, float]  # w x y z
 
 SINK_NODE = "subvox_spatial"
 SPEAKERS = {"spFL": +1, "spFR": -1}   # sign of the azimuth spread
+NOD_MIN_RATE = 0.35        # rad/s: non-yaw head rate counted toward the ear-axis estimate
+NOD_MIN_ENERGY = 1.5       # rad²/s of it before the estimate is trusted (a few nods)
+NOD_DOMINANCE = 3.0        # principal axis must carry this many times the rest (nods vs rolls)
 
 
 # ---------------------------------------------------------------- small vector / quaternion kit
@@ -95,6 +98,18 @@ def qslerp(a: Quat, b: Quat, t: float) -> Quat:
     return tuple(sa * x + sb * y for x, y in zip(a, b))
 
 
+def rotate_min(a: Vec, b: Vec, v: Vec) -> Vec:
+    """`v` turned by the smallest rotation that takes unit vector `a` onto unit vector `b`."""
+    axis = cross(a, b)
+    s = math.sqrt(dot(axis, axis))
+    c = max(-1.0, min(1.0, dot(a, b)))
+    if s < 1e-9:
+        return v if c > 0 else tuple(-x for x in v)
+    k = tuple(x / s for x in axis)
+    kxv = cross(k, v)
+    return tuple(v[i] * c + kxv[i] * s + k[i] * dot(k, v) * (1 - c) for i in range(3))
+
+
 def wrap180(deg: float) -> float:
     return (deg + 180.0) % 360.0 - 180.0
 
@@ -115,9 +130,15 @@ class HeadTracker:
 
     All geometry is done in the quaternion's gravity-aligned world frame: `W` is true up, the
     stage is the horizontal plane through the ears, and the reference forward `f_ref` is a
-    horizontal world vector. Only the *azimuthal* direction of the calibrated forward axis in
-    the sensor frame matters, so how the bud sits in the ear (tilt) does not skew the stage:
-    a bud tilted 40° would otherwise turn a yaw into a mix of yaw, pitch and roll.
+    horizontal world vector. The head's heading is `ear axis x up`: the ear axis `L_dev` is the
+    only head axis the ear itself imposes on the bud, and pitching or rolling the head leaves
+    it (and so the heading) alone. A Powerbeat pivots about its insertion axis from one wearing
+    to the next, so the calibrated ear axis is first corrected by the smallest rotation that
+    takes the calibrated up to today's up (`seat()`, head taken as level), then refined from
+    the nods seen while listening (`_refine_ear_axis()`): the horizontal part of the head's
+    angular velocity is nearly always about the ear axis. Taking a single calibrated forward
+    vector instead, as before, failed as soon as that vector approached the vertical: with the
+    bud pivoted 90° a 30° tilt back put the whole stage in one ear.
 
     `--gyro` mode integrates the gyro into `q` instead (world frame = sensor frame at start).
     """
@@ -133,7 +154,15 @@ class HeadTracker:
         self.q: Quat = (1.0, 0.0, 0.0, 0.0)          # sensor -> world
         self.W: Vec | None = None                     # world up
         self.f_ref: Vec | None = None                 # reference (stage) forward, world frame, horizontal
-        self.fwd_dev: Vec = tuple(cal.forward) if cal.forward else (1.0, 0.0, 0.0)   # head forward, sensor frame
+        self.left_cal: Vec = tuple(cal.left) if cal.left else (0.0, 1.0, 0.0)   # ear axis at calibration, sensor frame
+        self.up_cal: Vec = tuple(cal.up) if cal.up else (0.0, 0.0, 1.0)
+        self.L_dev: Vec = self.left_cal                # ear axis for today's seating, sensor frame
+        self.U_ref: Vec | None = None                  # true up in the sensor frame when last settled
+        self.ear_axis_source = "calibration"
+        self._fwd_last: Vec = (1.0, 0.0, 0.0)
+        self._nod = [[0.0] * 3 for _ in range(3)]      # scatter of the non-yaw rate, sensor frame
+        self._nod_energy = 0.0
+        self._next_refine = 0.0
         self._t_prev: float | None = None
         self._still_since: float | None = None
         self._boot_acc: list[Vec] = []
@@ -158,21 +187,87 @@ class HeadTracker:
         return norm(tuple(x - dot(v, self.W) * w for x, w in zip(v, self.W)))
 
     def head_axes(self, q: Quat) -> tuple[Vec, Vec, Vec]:
-        """(forward, left, up) of the head in the sensor frame for attitude q: up is true vertical
-        brought into the sensor frame, forward the calibrated forward made horizontal."""
+        """(forward, left, up) of the level frame carried by the head, in the sensor frame for
+        attitude q: up is true vertical, forward = ear axis x up (the heading), left completes it."""
         up = qrot(qconj(q), self.W)
-        fwd = norm(tuple(f - dot(self.fwd_dev, up) * u for f, u in zip(self.fwd_dev, up)))
+        f = cross(self.L_dev, up)
+        if dot(f, f) < 1e-6:                          # ear axis vertical (head on its side): keep the heading
+            f = self._fwd_last
+        fwd = norm(f)
+        self._fwd_last = fwd
         left = norm(cross(up, fwd))
         return fwd, left, up
 
     def forward_world(self, q: Quat) -> Vec:
-        """Where the head points, world frame."""
-        return qrot(q, self.fwd_dev)
+        """The heading, world frame (horizontal)."""
+        return qrot(q, self.head_axes(q)[0])
 
     def recentre(self) -> None:
+        """Where the head points now is the front."""
         if self.W is not None:
             self.f_ref = self._horizontal(self.forward_world(self.q))
             self.ref_set = True
+
+    def seat(self) -> None:
+        """Take the head as level and work out today's ear axis: the calibrated one turned by the
+        smallest rotation that brings the calibrated up onto the current true up. Also restarts
+        the nod statistics, since the bud may have moved."""
+        if self.W is None:
+            return
+        u = qrot(qconj(self.q), self.W)
+        self.L_dev = norm(rotate_min(self.up_cal, u, self.left_cal))
+        self.U_ref = u
+        self.ear_axis_source = "seating"
+        self._nod = [[0.0] * 3 for _ in range(3)]
+        self._nod_energy = 0.0
+
+    def settle(self) -> None:
+        """A settled, level pose: fix the seating and call this way the front."""
+        self.seat()
+        self.recentre()
+
+    def _accumulate_nod(self, w_body: Vec, up: Vec, dt: float) -> None:
+        w_h = tuple(x - dot(w_body, up) * u for x, u in zip(w_body, up))   # pitch + roll part of the rate
+        e = dot(w_h, w_h)
+        if e < NOD_MIN_RATE ** 2:
+            return
+        for i in range(3):
+            for j in range(3):
+                self._nod[i][j] += w_h[i] * w_h[j] * dt
+        self._nod_energy += e * dt
+
+    def _refine_ear_axis(self) -> bool:
+        """Adopt the principal axis of the non-yaw rotation seen so far as the ear axis, when it is
+        dominant and near the current estimate. The stage is kept where it is (f_ref follows)."""
+        if self._nod_energy < NOD_MIN_ENERGY or self.W is None:
+            return False
+        m = self._nod
+        mv = lambda v: tuple(sum(m[i][j] * v[j] for j in range(3)) for i in range(3))
+        v = self.L_dev
+        for _ in range(40):                           # power iteration from the current estimate
+            v2 = mv(v)
+            n = math.sqrt(dot(v2, v2))
+            if n < 1e-12:
+                return False
+            v = tuple(x / n for x in v2)
+        lam1 = dot(v, mv(v))
+        rest = m[0][0] + m[1][1] + m[2][2] - lam1
+        if lam1 < NOD_DOMINANCE * max(rest, 1e-9):
+            return False
+        if dot(v, self.L_dev) < 0:
+            v = tuple(-x for x in v)
+        c = dot(v, self.L_dev)
+        if c < math.cos(math.radians(45)) or c > math.cos(math.radians(0.5)):
+            return False                              # not the axis we expected / nothing to change
+        yaw = self.pose().yaw if self.f_ref is not None else None
+        self.L_dev = v
+        self.ear_axis_source = "nods"
+        if yaw is not None:                           # same yaw reading with the new axis: no jump
+            f_h = self.forward_world(self.q)
+            cy, sy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+            wxf = cross(self.W, f_h)
+            self.f_ref = norm(tuple(cy * f - sy * x for f, x in zip(f_h, wxf)))
+        return True
 
     # -- update
     def update(self, s: MotionSample) -> Pose | None:
@@ -218,6 +313,7 @@ class HeadTracker:
                 return None
             self._smooth_omega(w_body, dt)
             self.q = q
+            self._accumulate_nod(w_body, qrot(qconj(q), self.W), dt)
         else:
             if not self.ready:
                 self._boot_acc.append(a)
@@ -253,8 +349,10 @@ class HeadTracker:
         else:
             self._still_since = None
         still = self._still_since is not None and now - self._still_since >= self.still_after
-        if still and not self.ref_set:           # first settled pose after start is the front
-            self.recentre()
+        if still and not self.ref_set:           # first settled pose after start: seating + front
+            self.settle()
+        elif still and now >= self._next_refine and self._refine_ear_axis():
+            self._next_refine = now + 2.0
         elif still and self.recentre_tau > 0 and self.f_ref is not None:
             # let the stage drift toward where the head points, horizontally
             f_now = self._horizontal(self.forward_world(self.q))
@@ -306,19 +404,16 @@ class HeadTracker:
     def pose(self, still: bool = False) -> Pose:
         if self.f_ref is None:
             self.recentre()
-        f_w = self.forward_world(self.q)
-        fwd, left, up = self.head_axes(self.q)
+        f_h = self.forward_world(self.q)                        # heading, horizontal
         l_ref = cross(self.W, self.f_ref)                       # reference left, world frame
-        f_h = self._horizontal(f_w)
         yaw = math.degrees(math.atan2(dot(f_h, l_ref), dot(f_h, self.f_ref)))
-        pitch = math.degrees(math.asin(max(-1.0, min(1.0, dot(f_w, self.W)))))
-        # roll: how far the calibrated ear-to-ear axis is out of level (right ear down positive)
-        roll = math.degrees(math.asin(max(-1.0, min(1.0, dot(qrot(self.q, norm(cross(self.cal_up_dev(), self.fwd_dev))), self.W)))))
+        # pitch / roll (readouts only): the head frame fixed at the last settle, sensor coordinates
+        u_ref = self.U_ref if self.U_ref is not None else qrot(qconj(self.q), self.W)
+        f_dev = norm(cross(self.L_dev, u_ref))
+        clamp = lambda x: max(-1.0, min(1.0, x))
+        pitch = math.degrees(math.asin(clamp(dot(qrot(self.q, f_dev), self.W))))
+        roll = math.degrees(math.asin(clamp(dot(qrot(self.q, self.L_dev), self.W))))
         return Pose(yaw, pitch, roll, still, math.degrees(self.rate))
-
-    def cal_up_dev(self) -> Vec:
-        """Calibrated head-up in the sensor frame (for the roll readout only)."""
-        return tuple(self.cal.up) if self.cal.up else qrot(qconj(self.q), self.W)
 
     def speaker_direction(self, azimuth_deg: float, elevation_deg: float = 0.0, lead: float = 0.0) -> tuple[float, float]:
         """Where a stage-fixed source at (az, el) is, seen from the head `lead` s from now:
@@ -453,7 +548,8 @@ class DemoTracker(HeadTracker):
     def __init__(self) -> None:
         super().__init__(HeadCalibration())
         self.W = (0.0, 0.0, 1.0)
-        self.fwd_dev = (1.0, 0.0, 0.0)
+        self.L_dev = (0.0, 1.0, 0.0)
+        self.U_ref = (0.0, 0.0, 1.0)
         self.ready = True
         self.recentre()
         self.t0 = time.monotonic()

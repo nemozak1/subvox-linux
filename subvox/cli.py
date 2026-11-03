@@ -363,7 +363,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
           (", gyro integration" if a.gyro else ", buds' attitude quaternion")
     tracker = sp.HeadTracker(cal, recentre_tau=settings["linger"], use_quaternion=not a.gyro)
     print(f"spatial: sink {node}, {src}; keys: c recentre, q quit; `subvox recentre` from another shell")
-    signal.signal(signal.SIGUSR1, lambda *_: tracker.recentre())
+    signal.signal(signal.SIGUSR1, lambda *_: tracker.settle())   # level head assumed: seating + front
     import os
     calib.CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
     SPATIAL_PID.write_text(str(os.getpid()))
@@ -423,7 +423,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                 if k == "q":
                     break
                 if k == "c":
-                    tracker.recentre()
+                    tracker.settle()
                 now = time.monotonic()
                 if now >= next_status:
                     next_status = now + 0.5
@@ -433,7 +433,8 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                     write_status(stream=stream_state, hz=motion.sample_rate if motion else 0.0,
                                  yaw=pose.yaw if pose else 0.0, pitch=pose.pitch if pose else 0.0,
                                  roll=pose.roll if pose else 0.0, still=pose.still if pose else False,
-                                 rate=pose.rate if pose else 0.0, sent=renderer.updates)
+                                 rate=pose.rate if pose else 0.0, sent=renderer.updates,
+                                 ear_axis=tracker.ear_axis_source)
                 if now >= next_check:
                     # the sink node is recreated with a new id if the filter-chain restarts
                     next_check = now + 10

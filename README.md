@@ -104,10 +104,15 @@ attitude quaternion from each frame (`--gyro` integrates the gyro with gravity c
 and asks where the two stage-fixed ±30° speakers are seen from the head, pushing their
 Azimuth/Elevation to the sink through a long-lived `pw-cli`. The geometry is done in the
 quaternion's gravity-aligned world frame (true vertical is the yaw axis, the stage is the horizontal
-plane through the ears), so how the bud sits in the ear does not skew it; only the calibrated
-forward direction's azimuth is used. The reference frame slides back to the current pose while the head
-is still (`--recentre 6` s time constant), as Apple's does; `c` or `python3 -m subvox recentre` from
-another shell (SIGUSR1) makes where you look now the front at once. Regenerating
+plane through the ears). The heading is *ear axis × up*: the ear axis is the one head axis the ear
+imposes on the bud, so pitching or rolling the head cannot turn the stage. A Powerbeat pivots about
+its insertion axis from one wearing to the next (90° was measured), so at each settle the calibrated
+ear axis is corrected by the smallest rotation taking the calibrated up to today's up (head taken as
+level), and it is then refined from the nods seen while listening (the non-yaw part of the head's
+rotation is almost always about the ear axis). The reference frame slides back to the current pose
+while the head is still (`--recentre 6` s time constant), as Apple's does; `c` or `python3 -m subvox
+recentre` from another shell (SIGUSR1) makes where you look now the front at once and redoes the
+seating. `tests/test_spatial.py` drives a synthetic pivoted bud through tilts and nods. Regenerating
 the HRIRs at 10 Hz costs the filter-chain process ~0.6 % CPU. `--demo` sweeps yaw ±60° without
 the buds. A2DP adds ~150–250 ms, so it lags Apple's.
 
