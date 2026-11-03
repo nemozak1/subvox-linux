@@ -126,8 +126,9 @@ subvox ctl toggle | status | set linger 10 | linger +1 | recentre | settings | i
 ```
 
 `subvox ctl install` writes `~/.config/systemd/user/subvox-spatial.service` and the `~/.local/bin/subvox`
-wrapper and prints a Waybar `custom/spatial` module (click on/off, scroll linger, right-click
-settings). Settings live in `~/.config/subvox/spatial.json` and the daemon reloads them within half a
+wrapper and prints a Waybar `image#spatial` module: a white pixel-art headphone icon painted by
+`~/.config/athanor/waybar/spatial.py icon` (grey while waiting for the buds, dark when off); click
+on/off, middle-click recentre, scroll linger, right-click settings. Settings live in `~/.config/subvox/spatial.json` and the daemon reloads them within half a
 second; it writes `~/.local/state/subvox/spatial-status.json` for the bar. The settings popup is GTK 3
 on a layer-shell surface hanging off the bar (python3-gi, gir1.2-gtklayershell-0.1; the `subvox`
 package itself stays stdlib). "Linger" is the time the stage stays put before drifting back to where

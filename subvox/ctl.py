@@ -115,12 +115,12 @@ WRAPPER_SH = f"""#!/bin/sh
 cd "{REPO}" && exec python3 -m subvox "$@"
 """
 
-WAYBAR_SNIPPET = """  "custom/spatial": {
-    "exec": "~/.config/athanor/waybar/spatial.py watch",
-    "return-type": "json",
-    "restart-interval": 5,
-    "format": " {} ",
+WAYBAR_SNIPPET = """  "image#spatial": {
+    "exec": "~/.config/athanor/waybar/spatial.py icon",
+    "size": 22,
+    "interval": 1,
     "on-click": "~/.local/bin/subvox ctl toggle",
+    "on-click-middle": "~/.local/bin/subvox ctl recentre",
     "on-click-right": "~/.local/bin/subvox ctl settings",
     "on-scroll-up": "~/.local/bin/subvox ctl linger +1",
     "on-scroll-down": "~/.local/bin/subvox ctl linger -1"
