@@ -101,8 +101,11 @@ SOFA azimuth is counter-clockwise from the front, 0–360. Nothing is installed 
 
 **Head tracking** (`subvox/spatial.py`): `python3 -m subvox spatial` takes the buds' own fused
 attitude quaternion from each frame (`--gyro` integrates the gyro with gravity correction instead)
-and every 100 ms asks where the two room-fixed ±30° speakers are seen from the head, pushing their
-Azimuth/Elevation to the sink through a long-lived `pw-cli`. The reference frame slides back to the current pose while the head
+and asks where the two stage-fixed ±30° speakers are seen from the head, pushing their
+Azimuth/Elevation to the sink through a long-lived `pw-cli`. The geometry is done in the
+quaternion's gravity-aligned world frame (true vertical is the yaw axis, the stage is the horizontal
+plane through the ears), so how the bud sits in the ear does not skew it; only the calibrated
+forward direction's azimuth is used. The reference frame slides back to the current pose while the head
 is still (`--recentre 6` s time constant), as Apple's does; `c` or `python3 -m subvox recentre` from
 another shell (SIGUSR1) makes where you look now the front at once. Regenerating
 the HRIRs at 10 Hz costs the filter-chain process ~0.6 % CPU. `--demo` sweeps yaw ±60° without

@@ -111,10 +111,15 @@ class Pose:
 
 
 class HeadTracker:
-    """Attitude from gyro + gravity, relative to a slowly recentring reference.
+    """Head pose from the buds' attitude quaternion, and where room-fixed speakers are seen from it.
 
-    `q` maps sensor-frame vectors to the room frame (room frame = sensor frame of the
-    calibrated centred pose). `q_ref` is the reference the stage is anchored to.
+    All geometry is done in the quaternion's gravity-aligned world frame: `W` is true up, the
+    stage is the horizontal plane through the ears, and the reference forward `f_ref` is a
+    horizontal world vector. Only the *azimuthal* direction of the calibrated forward axis in
+    the sensor frame matters, so how the bud sits in the ear (tilt) does not skew the stage:
+    a bud tilted 40° would otherwise turn a yaw into a mix of yaw, pitch and roll.
+
+    `--gyro` mode integrates the gyro into `q` instead (world frame = sensor frame at start).
     """
 
     def __init__(self, cal: HeadCalibration, gravity_tau: float = 2.0, recentre_tau: float = 6.0,
@@ -125,60 +130,73 @@ class HeadTracker:
         self.recentre_tau = recentre_tau
         self.still_rate = math.radians(still_rate_deg)
         self.still_after = still_after
-        self.q: Quat = (1.0, 0.0, 0.0, 0.0)
-        self.q_ref: Quat = (1.0, 0.0, 0.0, 0.0)
-        self.up: Vec | None = tuple(cal.up) if cal.up else None
-        self.left: Vec | None = tuple(cal.left) if cal.left else None
-        self.forward: Vec | None = tuple(cal.forward) if cal.forward else None
+        self.q: Quat = (1.0, 0.0, 0.0, 0.0)          # sensor -> world
+        self.W: Vec | None = None                     # world up
+        self.f_ref: Vec | None = None                 # reference (stage) forward, world frame, horizontal
+        self.fwd_dev: Vec = tuple(cal.forward) if cal.forward else (1.0, 0.0, 0.0)   # head forward, sensor frame
         self._t_prev: float | None = None
         self._still_since: float | None = None
         self._boot_acc: list[Vec] = []
-        self.ready = self.up is not None
+        self._grav_w: list[Vec] = []                  # gravity seen in the world frame (quaternion check)
+        self.ready = False
+        self.ref_set = False
         self.rate = 0.0
-        self.omega: Vec = (0.0, 0.0, 0.0)   # body angular velocity, rad/s, EMA (tau omega_tau)
+        self.omega: Vec = (0.0, 0.0, 0.0)             # body angular velocity, rad/s, EMA (tau omega_tau)
         self.omega_tau = 0.06
-        self._n = 0                           # valid quaternion frames seen; the first few can be stale
-        self.ref_set = False                  # reference taken from a settled pose yet?
-        # Online gyro scale: angle the gravity vector turned through vs. the raw gyro integral
-        # over the same window. Robust median of many nods/tilts. Off when the file is calibrated.
+        self._n = 0
+        # gyro mode only
         self.auto_scale = cal.up is None
         self.scale = cal.gyro_rad_per_lsb
-        self._win: list[tuple[float, Vec, Vec]] = []   # (t, up_dev, raw gyro - bias)
+        self._win: list[tuple[float, Vec, Vec]] = []
         self.scale_estimates: list[float] = []
+        if not use_quaternion and cal.up:
+            self.W = tuple(cal.up)
+            self.ready = True
 
-    # -- frame
-    def _init_frame(self, up: Vec) -> None:
-        self.up = norm(up)
-        if self.left is None:
-            seed = (1.0, 0.0, 0.0) if abs(self.up[0]) < 0.9 else (0.0, 1.0, 0.0)
-            left = [s - dot(seed, self.up) * u for s, u in zip(seed, self.up)]
-            self.left = norm(left)
-        self.forward = norm(cross(self.left, self.up))
-        self.ready = True
+    # -- frames
+    def _horizontal(self, v: Vec) -> Vec:
+        return norm(tuple(x - dot(v, self.W) * w for x, w in zip(v, self.W)))
+
+    def head_axes(self, q: Quat) -> tuple[Vec, Vec, Vec]:
+        """(forward, left, up) of the head in the sensor frame for attitude q: up is true vertical
+        brought into the sensor frame, forward the calibrated forward made horizontal."""
+        up = qrot(qconj(q), self.W)
+        fwd = norm(tuple(f - dot(self.fwd_dev, up) * u for f, u in zip(self.fwd_dev, up)))
+        left = norm(cross(up, fwd))
+        return fwd, left, up
+
+    def forward_world(self, q: Quat) -> Vec:
+        """Where the head points, world frame."""
+        return qrot(q, self.fwd_dev)
 
     def recentre(self) -> None:
-        self.q_ref = self.q
-        self.ref_set = True
+        if self.W is not None:
+            self.f_ref = self._horizontal(self.forward_world(self.q))
+            self.ref_set = True
 
     # -- update
     def update(self, s: MotionSample) -> Pose | None:
         # The accelerometer points along gravity, so head "up" is -accel.
         a = tuple(-v / ACCEL_LSB_PER_G for v in s.raw_accel)
         a_mag = math.sqrt(dot(a, a))
-        if not self.ready:
-            # No calibration: the first second at rest defines "up".
-            self._boot_acc.append(a)
-            if len(self._boot_acc) >= 25:
-                self._init_frame(tuple(sum(v[i] for v in self._boot_acc) / len(self._boot_acc) for i in range(3)))
-            return None
 
         if self.use_quaternion:
             q = quat_from_words(*s.raw_orient[:3])
             if q is None:
                 return None
             self._n += 1
-            if self._t_prev is None or self._n <= 5:   # the first frames after START can be stale
-                self.q = self.q_ref = q
+            if self._n <= 5:                          # the first frames after START can be stale
+                self.q = q
+                self._t_prev = s.t
+                return None
+            if self.W is None:
+                # World up = where the quaternion puts gravity; average the first second.
+                if 0.8 < a_mag < 1.2:
+                    self._grav_w.append(qrot(q, norm(a)))
+                if len(self._grav_w) >= 25:
+                    self.W = norm(tuple(sum(v[i] for v in self._grav_w) / len(self._grav_w) for i in range(3)))
+                    self.ready = True
+                self.q = q
                 self._t_prev = s.t
                 return None
             dt = s.t - self._t_prev
@@ -199,6 +217,12 @@ class HeadTracker:
             self._smooth_omega(w_body, dt)
             self.q = q
         else:
+            if not self.ready:
+                self._boot_acc.append(a)
+                if len(self._boot_acc) >= 25:
+                    self.W = norm(tuple(sum(v[i] for v in self._boot_acc) / len(self._boot_acc) for i in range(3)))
+                    self.ready = True
+                return None
             if self._t_prev is None:
                 self._t_prev = s.t
                 return None
@@ -213,12 +237,9 @@ class HeadTracker:
             w = tuple(c.gyro_sign * r * self.scale for r in raw)
             self.rate = math.sqrt(dot(w, w))
             self._smooth_omega(w, dt)
-            # integrate body rates
             self.q = qnorm(qmul(self.q, qfrom_rotvec(tuple(x * dt for x in w))))
-            # gravity pulls pitch/roll back when the accelerometer reads ~1 g
-            if 0.8 < a_mag < 1.2:
-                u_room = qrot(self.q, norm(a))
-                err = cross(u_room, self.up)
+            if 0.8 < a_mag < 1.2:                 # gravity pulls pitch/roll back
+                err = cross(qrot(self.q, norm(a)), self.W)
                 k = min(1.0, dt / self.gravity_tau)
                 self.q = qnorm(qmul(qfrom_rotvec(tuple(e * k for e in err)), self.q))
 
@@ -231,11 +252,14 @@ class HeadTracker:
             self._still_since = None
         still = self._still_since is not None and now - self._still_since >= self.still_after
         if still and not self.ref_set:           # first settled pose after start is the front
-            self.q_ref = self.q
-            self.ref_set = True
-        elif still and self.recentre_tau > 0:
-            self.q_ref = qslerp(self.q_ref, self.q, min(1.0, dt / self.recentre_tau))
-
+            self.recentre()
+        elif still and self.recentre_tau > 0 and self.f_ref is not None:
+            # let the stage drift toward where the head points, horizontally
+            f_now = self._horizontal(self.forward_world(self.q))
+            k = min(1.0, dt / self.recentre_tau)
+            self.f_ref = self._horizontal(tuple(r + k * (n - r) for r, n in zip(self.f_ref, f_now)))
+        if self.f_ref is None:
+            self.recentre()
         return self.pose(still)
 
     def _learn_scale(self, t: float, u: Vec, raw: Vec, dt: float) -> None:
@@ -249,7 +273,7 @@ class HeadTracker:
             return
         integ = tuple(sum(e[2][i] for e in self._win[1:]) for i in range(3))
         mid = norm(tuple(a + b for a, b in zip(u0, u)))
-        perp = tuple(x - dot(integ, mid) * m for x, m in zip(integ, mid))   # only rotation ⟂ up tilts it
+        perp = tuple(x - dot(integ, mid) * m for x, m in zip(integ, mid))
         mag = math.sqrt(dot(perp, perp))
         if mag <= 0:
             return
@@ -266,36 +290,44 @@ class HeadTracker:
         self.omega = tuple(o + k * (x - o) for o, x in zip(self.omega, w))
 
     # -- readouts
-    def q_rel(self, lead: float = 0.0) -> Quat:
-        """Head pose relative to the reference, extrapolated `lead` seconds ahead."""
-        q = self.q
-        if lead > 0:
-            rv = tuple(x * lead for x in self.omega)
-            mag = math.sqrt(dot(rv, rv))
-            cap = math.radians(45)
-            if mag > cap:
-                rv = tuple(x * cap / mag for x in rv)
-            q = qnorm(qmul(q, qfrom_rotvec(rv)))
-        return qmul(qconj(self.q_ref), q)
+    def q_at(self, lead: float = 0.0) -> Quat:
+        """Attitude extrapolated `lead` seconds ahead along the smoothed body rate."""
+        if lead <= 0:
+            return self.q
+        rv = tuple(x * lead for x in self.omega)
+        mag = math.sqrt(dot(rv, rv))
+        cap = math.radians(45)
+        if mag > cap:
+            rv = tuple(x * cap / mag for x in rv)
+        return qnorm(qmul(self.q, qfrom_rotvec(rv)))
 
     def pose(self, still: bool = False) -> Pose:
-        qr = self.q_rel()
-        fw = qrot(qr, self.forward)
-        lf = qrot(qr, self.left)
-        yaw = math.degrees(math.atan2(dot(fw, self.left), dot(fw, self.forward)))
-        pitch = math.degrees(math.asin(max(-1.0, min(1.0, dot(fw, self.up)))))
-        roll = math.degrees(math.asin(max(-1.0, min(1.0, dot(lf, self.up)))))
+        f_w = self.forward_world(self.q)
+        fwd, left, up = self.head_axes(self.q)
+        l_ref = cross(self.W, self.f_ref)                       # reference left, world frame
+        f_h = self._horizontal(f_w)
+        yaw = math.degrees(math.atan2(dot(f_h, l_ref), dot(f_h, self.f_ref)))
+        pitch = math.degrees(math.asin(max(-1.0, min(1.0, dot(f_w, self.W)))))
+        # roll: how far the calibrated ear-to-ear axis is out of level (right ear down positive)
+        roll = math.degrees(math.asin(max(-1.0, min(1.0, dot(qrot(self.q, norm(cross(self.cal_up_dev(), self.fwd_dev))), self.W)))))
         return Pose(yaw, pitch, roll, still, math.degrees(self.rate))
 
+    def cal_up_dev(self) -> Vec:
+        """Calibrated head-up in the sensor frame (for the roll readout only)."""
+        return tuple(self.cal.up) if self.cal.up else qrot(qconj(self.q), self.W)
+
     def speaker_direction(self, azimuth_deg: float, elevation_deg: float = 0.0, lead: float = 0.0) -> tuple[float, float]:
-        """Where a room-fixed source at (az, el) is, seen from the head `lead` s from now:
-        (azimuth 0-360, elevation)."""
+        """Where a stage-fixed source at (az, el) is, seen from the head `lead` s from now:
+        (azimuth 0-360 counter-clockwise from the nose, elevation)."""
         az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
-        s_ref = tuple(math.cos(el) * (math.cos(az) * f + math.sin(az) * l) + math.sin(el) * u
-                      for f, l, u in zip(self.forward, self.left, self.up))
-        s_dev = qrot(qconj(self.q_rel(lead)), s_ref)
-        az_d = math.degrees(math.atan2(dot(s_dev, self.left), dot(s_dev, self.forward))) % 360.0
-        el_d = math.degrees(math.asin(max(-1.0, min(1.0, dot(s_dev, self.up)))))
+        l_ref = cross(self.W, self.f_ref)
+        s_w = tuple(math.cos(el) * (math.cos(az) * f + math.sin(az) * l) + math.sin(el) * w
+                    for f, l, w in zip(self.f_ref, l_ref, self.W))
+        q = self.q_at(lead)
+        s_dev = qrot(qconj(q), s_w)
+        fwd, left, up = self.head_axes(q)
+        az_d = math.degrees(math.atan2(dot(s_dev, left), dot(s_dev, fwd))) % 360.0
+        el_d = math.degrees(math.asin(max(-1.0, min(1.0, dot(s_dev, up)))))
         return az_d, el_d
 
 
@@ -410,12 +442,15 @@ class DemoTracker(HeadTracker):
 
     def __init__(self) -> None:
         super().__init__(HeadCalibration())
-        self._init_frame((0.0, 0.0, 1.0))
+        self.W = (0.0, 0.0, 1.0)
+        self.fwd_dev = (1.0, 0.0, 0.0)
+        self.ready = True
+        self.recentre()
         self.t0 = time.monotonic()
 
     def tick(self) -> Pose:
         yaw = math.radians(60 * math.sin(2 * math.pi * 0.15 * (time.monotonic() - self.t0)))
-        self.q = qfrom_rotvec(tuple(u * yaw for u in self.up))
+        self.q = qfrom_rotvec(tuple(u * yaw for u in self.W))
         return self.pose(False)
 
 
