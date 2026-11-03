@@ -116,3 +116,19 @@ when nodding), the world up vector, and a gyro scale as a fallback. It writes
 `~/.local/share/subvox/head-calibration.json`, which `spatial` loads. `--analyze <csv> [--save]`
 re-runs the analysis on a recording. Uncalibrated, `spatial` takes "up" from the first second at
 rest and gets yaw right but mixes pitch and roll.
+
+**Desktop controls** (`subvox/ctl.py`, `tools/spatial-settings.py`):
+
+```sh
+subvox ctl on        # user service subvox-spatial, spatial sink default, playing streams moved onto it
+subvox ctl off       # service stopped, buds default again (plain AAC stereo), streams moved back
+subvox ctl toggle | status | set linger 10 | linger +1 | recentre | settings | install
+```
+
+`subvox ctl install` writes `~/.config/systemd/user/subvox-spatial.service` and the `~/.local/bin/subvox`
+wrapper and prints a Waybar `custom/spatial` module (click on/off, scroll linger, right-click
+settings). Settings live in `~/.config/subvox/spatial.json` and the daemon reloads them within half a
+second; it writes `~/.local/state/subvox/spatial-status.json` for the bar. The settings popup is GTK 3
+on a layer-shell surface hanging off the bar (python3-gi, gir1.2-gtklayershell-0.1; the `subvox`
+package itself stays stdlib). "Linger" is the time the stage stays put before drifting back to where
+you are facing.

@@ -8,6 +8,7 @@
   subvox calibrate [--analyze file]   scripted head moves -> head-calibration.json for spatial
   subvox spatial [--demo]             head-tracked spatial audio on the "Spatial (Powerbeats)" sink
   subvox recentre                     tell a running `spatial` that where you look now is the front
+  subvox ctl on|off|toggle|status|set|linger|settings|install   desktop controls (see ctl.py)
   subvox list | subvox forget <word>
 """
 
@@ -34,6 +35,7 @@ from .features import FeatureSet, energy
 from .motion import HeadphoneMotion, MotionSample, connected_device
 from . import calibrate as calib
 from . import spatial as sp
+from .settings import Settings, write_status
 
 
 class Keys:
@@ -317,14 +319,30 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     node = sp.find_node()
     if node is None:
         sys.exit("sink 'subvox_spatial' not found; run tools/install-spatial.sh")
+    settings = Settings()
+    for key in ("rate", "spread", "smooth", "lead", "deadband", "linger"):
+        val = getattr(a, key, None)
+        if val is not None and key != "smooth":
+            settings.set(key, val)
+    if a.no_elevation:
+        settings.set("elevation", False)
+    if not settings.path.exists():
+        settings.save()
     control = sp.SpatializerControl(node)
-    renderer = sp.StageRenderer(control, spread=a.spread, smooth_tau=a.smooth, elevation=not a.no_elevation, lead=a.lead,
-                                min_change=a.deadband)
-    period = 1.0 / a.rate
+    renderer = sp.StageRenderer(control, smooth_tau=a.smooth if a.smooth is not None else 0.04)
+
+    def apply_settings() -> float:
+        renderer.spread = settings["spread"]
+        renderer.lead = settings["lead"]
+        renderer.min_change = settings["deadband"]
+        renderer.elevation = settings["elevation"]
+        return 1.0 / settings["rate"]
+
+    period = apply_settings()
     if a.demo:
         tracker = sp.DemoTracker()
         cpu0, t0 = sp.filter_chain_cpu(), time.monotonic()
-        print(f"demo: sweeping yaw ±60° into sink {node} at {a.rate:.0f} Hz; Ctrl-C to stop")
+        print(f"demo: sweeping yaw ±60° into sink {node} at {1 / period:.0f} Hz; Ctrl-C to stop")
         try:
             while True:
                 pose = tracker.tick()
@@ -343,7 +361,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     cal = calib.HeadCalibration.load()
     src = ("calibrated" if cal.up else "uncalibrated: first second at rest defines up, yaw only is right") + \
           (", gyro integration" if a.gyro else ", buds' attitude quaternion")
-    tracker = sp.HeadTracker(cal, recentre_tau=a.recentre, use_quaternion=not a.gyro)
+    tracker = sp.HeadTracker(cal, recentre_tau=settings["linger"], use_quaternion=not a.gyro)
     print(f"spatial: sink {node}, {src}; keys: c recentre, q quit; `subvox recentre` from another shell")
     signal.signal(signal.SIGUSR1, lambda *_: tracker.recentre())
     import os
@@ -352,9 +370,11 @@ def cmd_spatial(a: argparse.Namespace) -> None:
     q: queue.Queue = queue.Queue()
     stop = threading.Event()
     motion = None
+    stream_state = "connecting"
     retry_at = 0.0
     next_tick = time.monotonic()
     next_check = time.monotonic() + 10
+    next_status = 0.0
     pose = None
     try:
         with Keys() as keys:
@@ -368,8 +388,10 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                             raise OSError("buds not connected")
                         motion = motion_thread(mac, q, stop)
                         tracker.ref_set = False      # take a fresh front once still
+                        stream_state = "open"
                         status_line("motion stream open")
                     except OSError as e:
+                        stream_state = "reconnecting"
                         status_line(f"motion: {e}; retrying in 3 s")
                         retry_at = now + 3
                 try:
@@ -377,6 +399,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                     if s is None:
                         status_line("motion stream ended; reconnecting")
                         motion = None
+                        stream_state = "reconnecting"
                         retry_at = time.monotonic() + 2
                         renderer.reset()
                         continue
@@ -389,6 +412,15 @@ def cmd_spatial(a: argparse.Namespace) -> None:
                 if k == "c":
                     tracker.recentre()
                 now = time.monotonic()
+                if now >= next_status:
+                    next_status = now + 0.5
+                    if settings.reload():
+                        period = apply_settings()
+                        tracker.recentre_tau = settings["linger"]
+                    write_status(stream=stream_state, hz=motion.sample_rate if motion else 0.0,
+                                 yaw=pose.yaw if pose else 0.0, pitch=pose.pitch if pose else 0.0,
+                                 roll=pose.roll if pose else 0.0, still=pose.still if pose else False,
+                                 rate=pose.rate if pose else 0.0, sent=renderer.updates)
                 if now >= next_check:
                     # the sink node is recreated with a new id if the filter-chain restarts
                     next_check = now + 10
@@ -411,6 +443,7 @@ def cmd_spatial(a: argparse.Namespace) -> None:
         stop.set()
         renderer.reset()
         control.close()
+        write_status(stream="stopped")
         SPATIAL_PID.unlink(missing_ok=True)
         print()
 
@@ -425,6 +458,11 @@ def cmd_recentre(a: argparse.Namespace) -> None:
         print("recentred")
     except (OSError, ValueError):
         sys.exit("no running `subvox spatial`")
+
+
+def cmd_ctl(a: argparse.Namespace) -> None:
+    from . import ctl
+    ctl.main(a.args)
 
 
 def cmd_list(a: argparse.Namespace) -> None:
@@ -462,15 +500,16 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("calibrate"); p.add_argument("--analyze", metavar="CSV", help="re-analyse a recording instead of recording")
     p.add_argument("--save", action="store_true", help="with --analyze: write head-calibration.json"); p.set_defaults(fn=cmd_calibrate)
     p = sub.add_parser("spatial"); p.add_argument("--demo", action="store_true", help="sweep yaw without the buds (load test)")
-    p.add_argument("--rate", type=float, default=12.5, help="max control updates per second (each one rebuilds the HRIRs)")
-    p.add_argument("--spread", type=float, default=30.0, help="speaker half-angle, degrees")
-    p.add_argument("--smooth", type=float, default=0.04, help="smoothing time constant, s")
-    p.add_argument("--lead", type=float, default=0.2, help="aim at the head pose this far ahead, s (A2DP ~0.21 + quantum 0.02; 0 = off)")
-    p.add_argument("--recentre", type=float, default=6.0, help="recentre time constant when still, s (0 = never)")
+    p.add_argument("--rate", type=float, help="max control updates per second (each one rebuilds the HRIRs); default from spatial.json")
+    p.add_argument("--spread", type=float, help="speaker half-angle, degrees")
+    p.add_argument("--smooth", type=float, help="smoothing time constant, s (default 0.04)")
+    p.add_argument("--lead", type=float, help="aim at the head pose this far ahead, s (A2DP ~0.21 + quantum 0.02; 0 = off)")
+    p.add_argument("--linger", "--recentre", dest="linger", type=float, help="seconds for the stage to drift back when still (0 = never)")
     p.add_argument("--gyro", action="store_true", help="integrate the gyro instead of using the attitude quaternion")
-    p.add_argument("--deadband", type=float, default=1.5, help="only send when a speaker moved this many degrees")
+    p.add_argument("--deadband", type=float, help="only send when a speaker moved this many degrees")
     p.add_argument("--no-elevation", action="store_true"); p.set_defaults(fn=cmd_spatial)
     sub.add_parser("recentre").set_defaults(fn=cmd_recentre)
+    p = sub.add_parser("ctl", add_help=False); p.add_argument("args", nargs=argparse.REMAINDER); p.set_defaults(fn=cmd_ctl)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     p = sub.add_parser("forget"); p.add_argument("word"); p.set_defaults(fn=cmd_forget)
     a = ap.parse_args(argv)
